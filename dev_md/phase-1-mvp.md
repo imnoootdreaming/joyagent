@@ -161,9 +161,17 @@ uv add fastapi uvicorn langchain langchain-openai langchain-anthropic python-dot
 
 **创建 `.env`：**
 ```env
-OPENAI_API_KEY=sk-xxx
+# === Anthropic ===
 ANTHROPIC_API_KEY=sk-ant-xxx
-DEFAULT_MODEL=claude-sonnet-4-6       # 或 gpt-4o
+
+# === OpenAI ===
+OPENAI_API_KEY=sk-xxx
+
+# === DeepSeek ===
+DEEPSEEK_API_KEY=sk-xxx
+
+# === 默认模型 ===
+DEFAULT_MODEL=DeepSeek-v4-pro[1m]     # 或 claude-sonnet-4-6 / gpt-4o
 ```
 
 **创建 `app/core/config.py`：**
@@ -175,7 +183,8 @@ load_dotenv()
 class Config:
     OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "claude-sonnet-4-6")
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+    DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-v4-pro[1m]")
     MAX_ITERATIONS = 15
 ```
 
@@ -197,6 +206,13 @@ def get_llm(model_name: str = None, tools: list[dict] = None):
             api_key=Config.ANTHROPIC_API_KEY,
             temperature=0.3,
             max_tokens=4096,
+        )
+    elif "deepseek" in model_name.lower():
+        llm = ChatOpenAI(
+            model=model_name,
+            api_key=Config.DEEPSEEK_API_KEY,
+            base_url="https://api.deepseek.com",
+            temperature=0.3,
         )
     else:
         llm = ChatOpenAI(
