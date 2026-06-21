@@ -1,7 +1,7 @@
-from joyagent.app.agent.prompt import SYSTEM_PROMPT
-from joyagent.app.service.llm_service import get_or_create_client
-from joyagent.app.tools.schemas import TOOLS, TOOL_HANDLERS
-from joyagent.app.core.config import Config
+from app.agent.prompt import SYSTEM_PROMPT
+from app.service.llm_service import get_or_create_client
+from app.tools.schemas import TOOLS, TOOL_HANDLERS
+from app.core.config import Config
 
 # ── Agent 核心循环常量 ──
 DEFAULT_MAX_TOKENS = 4096

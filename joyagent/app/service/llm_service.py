@@ -1,6 +1,6 @@
 import os
 from anthropic import Anthropic
-from joyagent.app.core.config import Config
+from app.core.config import Config
 
 
 def get_client(model_name: str = None) -> Anthropic:

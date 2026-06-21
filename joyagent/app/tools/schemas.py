@@ -1,7 +1,7 @@
 # Anthropic 原生工具格式：{"name": ..., "description": ..., "input_schema": {...}}
 # 无需 OpenAI Function Calling 的 "type": "function" 包装层
-from joyagent.app.tools.file_read import read_file
-from joyagent.app.tools.file_write import write_file
+from app.tools.file_read import read_file
+from app.tools.file_write import write_file
 
 READ_FILE_TOOL = {
     "name": "read_file",
