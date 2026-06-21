@@ -95,8 +95,8 @@ app/
 
 ```python
 from typing import TypedDict, Annotated, Sequence
-from langchain_core.messages import BaseMessage
 from langgraph.graph.message import add_messages
+# 消息使用纯 dict 格式（Anthropic 原生），不再依赖 langchain_core.messages
 
 class TaskStep(TypedDict):
     """计划中的单个步骤"""
@@ -109,7 +109,8 @@ class AgentState(TypedDict):
     """LangGraph StateGraph 的核心状态"""
     
     # 消息历史（自动追加——add_messages reducer）
-    messages: Annotated[Sequence[BaseMessage], add_messages]
+    # Anthropic 原生格式：list[dict]，每个 dict 为 {"role": "user/assistant", "content": ...}
+    messages: Annotated[Sequence[dict], add_messages]
     
     # 任务计划
     plan: list[TaskStep]
@@ -201,26 +202,34 @@ async def plan(state: AgentState) -> dict:
     2. 拆解为可执行的步骤（TaskStep 列表）
     3. 为每个步骤推荐工具
     """
-    planner_llm = get_llm(temperature=0.2)  # 低温度，更确定性
-    
+    from app.services.llm_service import get_or_create_client
+    client = get_or_create_client()
+
     plan_prompt = f"""
     You are a task planner. Given the user's request, break it down into
     concrete, executable steps. For each step, specify which tool to use.
-    
+
     Available tools: {tool_registry.list_tool_names()}
-    
+
     User request: {extract_user_request(state["messages"])}
-    
+
     Output format (JSON array):
     [
       {{"step_id": 1, "description": "...", "tool_name": "read_file"}},
       ...
     ]
     """
-    
-    response = await planner_llm.ainvoke([HumanMessage(content=plan_prompt)])
-    plan = parse_plan_json(response.content)  # 解析为 list[TaskStep]
-    
+
+    # Anthropic 原生调用（不带 tools——Planner 只输出计划，不执行）
+    response = client.messages.create(
+        model=MODEL,
+        system="You are a task planner. Output only valid JSON.",
+        messages=[{"role": "user", "content": plan_prompt}],
+        max_tokens=4096,
+    )
+    plan_text = extract_text(response.content)
+    plan = parse_plan_json(plan_text)  # 解析为 list[TaskStep]
+
     return {"plan": plan, "current_step_index": 0}
 ```
 
@@ -232,27 +241,57 @@ async def execute_step(state: AgentState) -> dict:
     """
     Executor Node 的职责：
     1. 取 plan[current_step_index]
-    2. 调用 LLM + 工具执行当前步骤
+    2. 调用 LLM + 工具执行当前步骤（Anthropic 原生 Tool Use）
     3. 记录执行结果到 tool_call_history
     """
+    from app.services.llm_service import get_or_create_client
+    client = get_or_create_client()
     current_step = state["plan"][state["current_step_index"]]
-    
-    # 使用 Phase 2 的 Agent（ReAct Loop）执行单个步骤
-    executor_llm = get_llm(tools=tool_registry.get_openai_schemas())
-    
+
     step_prompt = f"""
     Execute this step: {current_step['description']}
     Use the {current_step['tool_name']} tool if needed.
     After completion, report the result.
     """
-    
-    # 复用 Phase 1-2 的单步执行逻辑
-    result = await execute_single_step(executor_llm, step_prompt, state["messages"])
-    
+
+    # 使用 Anthropic 原生 Tool Use loop 执行单个步骤
+    messages = [{"role": "user", "content": step_prompt}]
+    tool_log = []
+
+    for _ in range(5):  # 单步最多 5 轮工具调用
+        response = client.messages.create(
+            model=MODEL,
+            system="You are a task executor. Use tools to complete each step.",
+            messages=messages,
+            tools=tool_registry.get_tool_schemas(),
+            max_tokens=4096,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            break
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            result = await tool_registry.execute(block.name, **block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": result.output,
+            })
+            tool_log.append({
+                "tool_name": block.name, "input": block.input,
+                "result": result.output, "success": result.success,
+            })
+
+        messages.append({"role": "user", "content": tool_results})
+
     return {
-        "messages": result.messages,
+        "messages": messages,
         "current_step_index": state["current_step_index"] + 1,
-        "tool_call_history": state["tool_call_history"] + [result.log],
+        "tool_call_history": state["tool_call_history"] + tool_log,
     }
 ```
 
@@ -268,28 +307,34 @@ async def reflect(state: AgentState) -> dict:
     3. 如果未完成，分析原因（工具失败？计划不合理？）
     4. 决定：继续 / 重新规划 / 结束
     """
-    reflector_llm = get_llm(temperature=0.3)
-    
+    from app.services.llm_service import get_or_create_client
+    client = get_or_create_client()
+
     reflection_prompt = f"""
     You are a quality inspector. Review the execution results:
-    
+
     Original plan: {state['plan']}
     Steps completed: {state['current_step_index']}
     Tool call history: {state['tool_call_history']}
     Errors: {state.get('error_message', 'None')}
-    
+
     Answer these questions:
     1. Is the task completed? (yes/no)
     2. If not, what went wrong?
     3. Should we replan? (yes/no)
     4. What should we do differently?
-    
+
     Output format: JSON with keys: task_completed, analysis, need_replan, suggestion
     """
-    
-    response = await reflector_llm.ainvoke([HumanMessage(content=reflection_prompt)])
-    reflection = parse_reflection_json(response.content)
-    
+
+    response = client.messages.create(
+        model=MODEL,
+        system="You are a quality inspector. Output only valid JSON.",
+        messages=[{"role": "user", "content": reflection_prompt}],
+        max_tokens=4096,
+    )
+    reflection = parse_reflection_json(extract_text(response.content))
+
     return {
         "task_completed": reflection["task_completed"],
         "need_replan": reflection.get("need_replan", False),
@@ -356,12 +401,13 @@ result = await agent.chat("创建 hello.py")
 
 # Phase 3 的调用方式（复杂任务）
 initial_state = {
-    "messages": [HumanMessage(content="构建一个 Flask API 服务...")],
+    "messages": [{"role": "user", "content": "构建一个 Flask API 服务..."}],
     "plan": [],
     "current_step_index": 0,
     "reflection_count": 0,
     "max_reflections": 3,
     "task_completed": False,
+    "error_message": None,
     "tool_call_history": [],
 }
 final_state = await agent_workflow.ainvoke(initial_state)

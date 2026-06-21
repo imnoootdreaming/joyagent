@@ -203,23 +203,23 @@ class MultiAgentState(TypedDict):
 # app/agent/base.py
 class BaseAgent:
     """所有 Agent 的基类"""
-    
+
     def __init__(self, role: AgentRole):
         self.role = role
-        self.llm = get_llm(
-            model=role.model,
-            tools=tool_registry.get_schemas_for(role.tools),
-            temperature=role.temperature,
-        )
-    
+        self.client = get_or_create_client(role.model)
+        self.tools = tool_registry.get_tool_schemas_for(role.tools)
+
     async def run(self, task: str, state: MultiAgentState) -> dict:
         """Agent 主入口。子类可覆盖。"""
-        messages = [
-            SystemMessage(content=self.role.system_prompt),
-            HumanMessage(content=f"Task: {task}\nCurrent state: {state}"),
-        ]
-        response = await self.llm.ainvoke(messages)
-        return {"output": response.content, "agent": self.role.name}
+        # Anthropic 原生调用——system 是独立参数
+        response = self.client.messages.create(
+            model=self.role.model,
+            system=self.role.system_prompt,
+            messages=[{"role": "user", "content": f"Task: {task}\nCurrent state: {state}"}],
+            tools=self.tools,
+            max_tokens=4096,
+        )
+        return {"output": extract_text(response.content), "agent": self.role.name}
 ```
 
 ### Step 2：实现各 Agent（2 小时）
@@ -268,14 +268,15 @@ class AgentRouter:
     def __init__(self, strategy: str = "rule"):
         self.strategy = strategy
         if strategy == "llm":
-            self.router_llm = get_llm(model="claude-haiku-4-5", temperature=0)  # 轻量 LLM 做路由
-    
+            # 轻量 Anthropic client 做路由
+            self.router_client = get_or_create_client("claude-haiku-4-5")
+
     async def route(self, task: str, state: MultiAgentState) -> RouterDecision:
         if self.strategy == "rule":
             return self._rule_route(task)
         else:
             return await self._llm_route(task, state)
-    
+
     def _rule_route(self, task: str) -> RouterDecision:
         task_lower = task.lower()
         for keywords, agent_name in self.RULES:
@@ -289,20 +290,25 @@ class AgentRouter:
                 )
         # 默认 → Planner（让 Planner 决定）
         return RouterDecision(target_agent="planner", reason="Default routing", ...)
-    
+
     async def _llm_route(self, task: str, state: MultiAgentState) -> RouterDecision:
         """让轻量 LLM 判断任务应该发到哪个 Agent"""
         prompt = f"""
         Given this task: "{task}"
         And current state: {summarize(state)}
-        
+
         Which agent should handle this?
         Options: planner, coder, tester, reviewer
-        
+
         Respond with JSON: {{"agent": "...", "reason": "..."}}
         """
-        response = await self.router_llm.ainvoke(prompt)
-        return parse_router_json(response.content)
+        response = self.router_client.messages.create(
+            model="claude-haiku-4-5",
+            system="You are a task router. Output only valid JSON.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=256,
+        )
+        return parse_router_json(extract_text(response.content))
 ```
 
 ### Step 4：Agent 间通信（1 小时）
@@ -314,17 +320,17 @@ class AgentCommunication:
     def __init__(self, state: MultiAgentState):
         self.state = state
     
-    async def send_to_agent(self, from_agent: str, to_agent: str, 
+    async def send_to_agent(self, from_agent: str, to_agent: str,
                             message: str) -> None:
-        """发送消息给另一个 Agent"""
+        """发送消息给另一个 Agent（Anthropic dict 格式）"""
         self.state["messages"].append(
-            SystemMessage(content=f"[{from_agent} → {to_agent}]: {message}")
+            {"role": "user", "content": f"[{from_agent} → {to_agent}]: {message}"}
         )
-    
+
     async def broadcast(self, from_agent: str, message: str) -> None:
         """广播消息给所有 Agent"""
         self.state["messages"].append(
-            SystemMessage(content=f"[{from_agent} → ALL]: {message}")
+            {"role": "user", "content": f"[{from_agent} → ALL]: {message}"}
         )
     
     async def request_review(self, code_diff: str) -> dict:
@@ -362,7 +368,12 @@ class ConflictResolver:
         Can you find a compromise? Respond with: {{"resolved": true/false, "solution": "..."}}
         """
         
-        result = await self.llm.ainvoke(negotiation_prompt)
+        response = self.client.messages.create(
+            model=MODEL, system="You are a conflict resolver.",
+            messages=[{"role": "user", "content": negotiation_prompt}],
+            max_tokens=1024,
+        )
+        result = parse_json(extract_text(response.content))
         
         if result["resolved"]:
             return {"status": "resolved", "solution": result["solution"]}
@@ -385,7 +396,7 @@ class ConflictResolver:
 
 ```python
 async def multi_agent_pipeline(user_request: str) -> str:
-    state = MultiAgentState(messages=[HumanMessage(content=user_request)])
+    state = MultiAgentState(messages=[{"role": "user", "content": user_request}])
     router = AgentRouter(strategy="llm")
     
     # Phase 1: Planner 拆解任务

@@ -8,11 +8,11 @@
 
 ### Claude-Code 类自主编程智能体（独立开发）
 
-**技术栈：Python、FastAPI、LangGraph、OpenAI/Claude API、Redis、Docker、PostgreSQL、MCP、ChromaDB**
+**技术栈：Python、FastAPI、LangGraph、Anthropic SDK (Messages API)、DeepSeek API、Redis、Docker、PostgreSQL、MCP、ChromaDB**
 
 - 参考 Claude Code 架构独立实现自主编程 Agent，核⼼为 ReAct + Tool Calling 的 Agent Runtime，⽀持需求分析、任务规划、代码生成、自动测试与错误修复全流程⾃动化。
 - 基于 LangGraph StateGraph 构建 Agent Workflow，设计 Planner、Coder、Reviewer、Tester 多节点协作图，实现复杂任务拆解与状态流转，⽀持条件路由（Conditional Edge）实现⾮线性任务执⾏。
-- 基于 ReAct 与 Tool Calling 实现 Agent Runtime，支持文件系统、Shell、Git、Web Search、Browser 等 10+ 工具动态编排。
+- 基于 Anthropic Messages API 原生 Tool Use 实现 Agent Runtime，支持文件系统、Shell、Git、Web Search 等 10+ 工具动态编排，采用 stop_reason + block.type 模式判断工具调用。
 - 设计 Short-term Memory（滑动窗口 + 摘要压缩）、Long-term Memory（ChromaDB 向量检索）与 Reflection Memory（错误嵌入 + 相似经验召回），实现会话摘要、上下文压缩及任务状态持久化。
 - 基于 MCP 协议实现插件体系，集成官方 GitHub MCP Server、PostgreSQL MCP Server，并自建 1 个 Demo MCP Server 展示协议理解。
 - 基于 Docker Sandbox 构建安全代码执⾏环境，实现 CPU/内存/网络全限制 + 只读文件挂载，防容器逃逸。
@@ -62,53 +62,95 @@
 └───────────────────────────────────────────────────────────┘
 ```
 
-**伪代码表达：**
+**伪代码表达（Anthropic Messages API 原生模式）：**
 
 ```python
 async def agent_runtime(user_input: str, state: AgentState) -> str:
-    messages = state.messages + [HumanMessage(content=user_input)]
-    
+    # 1. 构建消息历史（dict 格式，非 LangChain 对象）
+    messages = state.messages + [{"role": "user", "content": user_input}]
+    system_prompt = assemble_system_prompt(state)
+    max_tokens = DEFAULT_MAX_TOKENS
+    recovery_state = RecoveryState()
+
     while state.iterations < state.max_iterations:
-        # 1. 构建上下文（含裁剪后的历史 + 可用工具定义）
-        context = build_context(messages, state.available_tools, state.memory)
-        
-        # 2. LLM 推理
-        response = await llm.ainvoke(context)
-        messages.append(response)
-        
-        # 3. 判断是否需要工具调用
-        if response.tool_calls:
-            for tc in response.tool_calls:
-                # 3a. 危险操作权限检查
-                if is_dangerous(tc) and not state.has_permission(tc):
-                    approval = await request_user_approval(tc)
-                    if not approval:
-                        messages.append(ToolMessage(content="User denied"))
-                        continue
-                
-                # 3b. 执行工具
-                result = await tool_registry.execute(tc)
-                messages.append(ToolMessage(content=str(result), tool_call_id=tc.id))
-            
-            # 3c. 更新记忆
-            await state.memory.add_tool_call(tc, result)
-        
-        # 4. 判断是否需要用户输入（如 LLM 提出问题）
-        elif response.needs_user_clarification:
-            user_response = await ask_user(response.content)
-            messages.append(HumanMessage(content=user_response))
-        
-        # 5. 无工具调用 → 任务完成
-        else:
-            # 触发反思（Reflection）
-            await reflection_memory.record(state, success=True)
-            return response.content
-        
+        # 2. LLM 推理 — 原生 Anthropic SDK 调用
+        try:
+            response = with_retry(
+                lambda: client.messages.create(
+                    model=state.current_model,
+                    system=system_prompt,       # system 是独立参数
+                    messages=messages,           # 纯 dict 列表
+                    tools=TOOLS,                 # Anthropic 原生工具格式
+                    max_tokens=max_tokens,
+                ),
+                recovery_state,
+            )
+        except PromptTooLongError:
+            if not recovery_state.has_attempted_compact:
+                messages[:] = reactive_compact(messages)
+                recovery_state.has_attempted_compact = True
+                continue
+            return "[Error] Context too large."
+
+        # 3. 追加 assistant 回复到消息历史
+        messages.append({"role": "assistant", "content": response.content})
+
+        # 4. 判断 stop_reason（Anthropic 原生方式）
+        if response.stop_reason == "max_tokens":
+            # 4a. max_tokens 恢复：先升级 token 上限，再续写
+            if not recovery_state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                recovery_state.has_escalated = True
+                continue  # 不 append，用更大 max_tokens 重试同一请求
+            if recovery_state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                recovery_state.recovery_count += 1
+                continue
+            return  # 超出恢复上限
+
+        if response.stop_reason != "tool_use":
+            # 5. 无工具调用 → 模型认为任务完成
+            # 提取文本回复
+            for block in response.content:
+                if block.type == "text":
+                    return block.text
+            return "Task completed."
+
+        # 6. 有工具调用 → 执行工具
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            # 6a. 危险操作权限检查
+            if is_dangerous(block.name) and not state.has_permission(block.name):
+                approval = await request_user_approval(block)
+                if not approval:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": "User denied execution.",
+                    })
+                    continue
+
+            # 6b. 执行工具
+            handler = TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": output,
+            })
+
+            # 6c. 更新记忆
+            await state.memory.add_tool_call(block.name, block.input, output)
+
+        # 6d. 工具结果作为 user 消息追加
+        messages.append({"role": "user", "content": tool_results})
         state.iterations += 1
-    
-    # 达到最大迭代次数 → 记录反思
+
     await reflection_memory.record(state, success=False)
-    return "Task exceeded max iterations, final state saved."
+    return "Task exceeded max iterations."
 ```
 
 **面试要点：** 这是面试中第一个会被问的问题。你必须能画这个图，并解释每一步的设计决策。
@@ -157,10 +199,11 @@ async def agent_runtime(user_input: str, state: AgentState) -> str:
 | 决策 | 我们的选择 | 为什么 | 面试可能追问的替代方案 |
 |------|-----------|--------|----------------------|
 | Agent 框架 | **LangGraph** | 图结构天然适合复杂工作流；Conditional Edge 支持非线性执行；Checkpoint 支持暂停/恢复 | AutoGen、CrewAI、纯 ReAct |
-| LangChain 的角色 | **仅用于 ChatModel 抽象 + Prompt 模板**，不⽤ AgentExecutor | AgentExecutor 是黑盒，不可控；LangGraph 给出更细粒度控制 | 直接用 OpenAI/Anthropic SDK |
+| LLM 调用 | **Anthropic Python SDK（原生）** | 直接使用 `anthropic` 包，Messages API 原生调用；避免 LangChain 的抽象泄漏；`stop_reason` + `block.type` 模式精确控制工具调用 | LangChain ChatAnthropic、OpenAI SDK、DeepSeek SDK |
+| 工具格式 | **Anthropic 原生 tool_use 格式** | `{"name": "...", "description": "...", "input_schema": {...}}`；无需 OpenAI Function Calling 的 `"type": "function"` 包装层 | OpenAI Function Calling format |
 | 消息队列 | **MVP: Redis List；生产: RabbitMQ** | Redis 轻量快速适合 demo；但无 ACK，消息可能丢失 | RabbitMQ、Kafka、Celery |
 | 向量数据库 | **ChromaDB（轻量）→ pgvector（生产）** | ChromaDB 零配置适合 MVP；pgvector 与 PostgreSQL 共存减少运维 | Milvus、Pinecone、Weaviate |
-| 多模型支持 | **OpenAI + Claude 双模型** | 覆盖主流 API；展示多 provider 适配能力 | 单一模型、LiteLLM 统一网关 |
+| 多模型支持 | **Claude (Anthropic) + DeepSeek (兼容端点) + OpenAI** | 原生 SDK + 协议族分流；DeepSeek 和 Claude 共用 Anthropic Messages API 格式；OpenAI 通过独立分支适配 | LiteLLM 统一网关 |
 | 安全沙箱 | **Docker + seccomp + resource limits** | 成熟稳定；面试能展开安全设计细节 | gVisor、Firecracker、E2B |
 | AST 范围 | **仅 Python** | 工作量可控；Python AST 标准库自带；原理通用可类推 | 多语言 AST（tree-sitter） |
 
@@ -172,8 +215,8 @@ async def agent_runtime(user_input: str, state: AgentState) -> str:
 |------|------|------|-----------|
 | **Web 框架** | FastAPI + WebSocket | REST API + 实时日志推送 | Phase 1 / Phase 9 |
 | **Agent 框架** | LangGraph | 工作流编排、状态管理 | Phase 3 |
-| **LLM 调用** | LangChain ChatModel + OpenAI/Anthropic SDK | 统一模型调用接口 | Phase 1 |
-| **工具系统** | 自建 Tool Registry + MCP | 工具注册/发现/执行 | Phase 2 / Phase 8 |
+| **LLM 调用** | Anthropic Python SDK (原生) | Messages API 直接调用；`stop_reason` + `block.type` 判断工具循环 | Phase 1 |
+| **工具系统** | 自建 Tool Registry + MCP | 工具注册/发现/执行；Anthropic 原生 `input_schema` 格式 | Phase 2 / Phase 8 |
 | **代码执行** | Docker SDK + pytest | 安全隔离执行 + 自动测试 | Phase 5 |
 | **任务队列** | Redis (List + Pub/Sub) | 异步任务 + 状态缓存 | Phase 6 / Phase 9 |
 | **持久存储** | PostgreSQL + SQLAlchemy | Session / TaskLog 存储 | Phase 9 |
@@ -182,16 +225,26 @@ async def agent_runtime(user_input: str, state: AgentState) -> str:
 | **包管理** | uv (或 Poetry) | 依赖管理 | Phase 1 |
 | **部署** | Docker Compose | 一键启动全栈 | Phase 9 |
 
-### 关于 LangChain vs LangGraph 的说明
+### 关于 Anthropic SDK 与 LangGraph 的角色分工
 
 ```
-LangChain ──── 仅用于 ChatModel 抽象层 ──── 可选依赖，可用原生 SDK 替代
-LangGraph ──── 核心框架，不可替代 ──── 负责 Agent 状态图与工作流编排
+Anthropic SDK ──── 原生 LLM 调用 ──── client.messages.create() 直接调用 Messages API
+LangGraph    ──── 核心框架，不可替代 ── 负责 Agent 状态图与工作流编排
+LangChain    ──── 不引入 ──────────── 本项目不依赖 langchain/langchain-core
 ```
 
-- **LangChain 在本项目中的角色（最小化）：** `ChatOpenAI` / `ChatAnthropic` 封装、`SystemMessage` / `HumanMessage` / `AIMessage` / `ToolMessage` 类型、`PromptTemplate` 模板。
-- **不使用 LangChain 的：** `AgentExecutor`、`create_tool_calling_agent`、Chain 相关组件。
-- **为什么：** AgentExecutor 是黑盒，内部 ReAct 循环不可控；LangGraph 让我们自己写循环，精细控制每一步。
+- **Anthropic SDK 在本项目中的角色（唯一 LLM 调用方式）：**
+  - `client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))` — 一行注册，无需工厂函数
+  - `client.messages.create(model=..., system=..., messages=..., tools=..., max_tokens=...)` — 原生调用
+  - 消息格式：纯 Python dict `{"role": "user/assistant", "content": ...}`
+  - 工具格式：`{"name": "...", "description": "...", "input_schema": {...}}`
+  - 工具调用判断：`response.stop_reason == "tool_use"` + 遍历 `response.content` 检查 `block.type == "tool_use"`
+- **不使用 LangChain 的：** `AgentExecutor`、`create_tool_calling_agent`、`ChatOpenAI`、`ChatAnthropic`、`SystemMessage`、`HumanMessage`、`AIMessage`、`ToolMessage`、`bind_tools()`、Chain 相关组件。
+- **为什么不用 LangChain：**
+  1. 抽象泄漏：`ChatAnthropic` 封装了原生 SDK，但隐藏了 `stop_reason`、`block.type` 等关键控制点
+  2. 消息格式不透明：LangChain Message 类型增加了序列化/反序列化成本
+  3. 工具绑定黑盒：`bind_tools()` 内部转换了工具格式，调试困难
+  4. Anthropic SDK 本身已足够简洁：`client.messages.create()` 一行调用，无需额外封装
 
 ---
 
@@ -254,7 +307,8 @@ Phase 1: Agent MVP (ReAct + Tool Calling)
 
 | # | 问题 | 严重程度 | 修改方案 | 详见 |
 |---|------|---------|---------|------|
-| 1 | **缺少 ReAct Loop 核心设计** | 🔴 致命 | 在本文档 2.1 节补充完整循环伪代码与流程图 | 本文 §2.1 |
+| 0 | **开发范式使用 OpenAI/LangChain 风格** | 🔴 致命 | 全部文档改为 Anthropic 原生 SDK 范式：`client = Anthropic()` 一行注册、`stop_reason` + `block.type` 工具判断、`input_schema` 工具格式 | 全部 Phase |
+| 1 | **缺少 ReAct Loop 核心设计** | 🔴 致命 | 在本文档 2.1 节补充完整循环伪代码与流程图（Anthropic 原生模式） | 本文 §2.1 |
 | 2 | **各 Phase 只有 WHAT 没有 HOW** | 🔴 致命 | 每个 Phase 独立文档补充 Schema、伪代码、关键实现策略 | Phase 1-9 md |
 | 3 | **Phase 3 与 Phase 7 关系模糊** | 🔴 致命 | Phase 3 = 单 Agent 内部 Plan-Execute-Reflect；Phase 7 = 多 Agent 协作，拆分节点为独立 Agent | [Phase 3](phase-3-langgraph-workflow.md) §8, [Phase 7](phase-7-multi-agent.md) §1 |
 | 4 | **Memory 缺少向量数据库** | 🔴 致命 | Phase 6 引入 ChromaDB，补充语义检索与 Token 管理 | [Phase 6](phase-6-memory-system.md) §4 |
@@ -265,7 +319,7 @@ Phase 1: Agent MVP (ReAct + Tool Calling)
 | 9 | **缺少 State Schema 定义** | 🟡 严重 | 每个 Phase 补充核心数据模型 | 各 Phase §4 |
 | 10 | **缺少 Benchmark 评估方案** | 🟡 严重 | Phase 5/9 引入自建 10 题 Benchmark | [Phase 5](phase-5-sandbox-testing.md) §8, [Phase 9](phase-9-engineering.md) §8 |
 | 11 | **Phase 9 内容过多** | 🟢 中等 | 拆分为数据层（9A）+ 部署（9B），或优先做核心 | [Phase 9](phase-9-engineering.md) |
-| 12 | **LangChain 用途不明确** | 🟢 中等 | 在本文档 3.1 节明确：仅 ChatModel + Message 类型 | 本文 §3 |
+| 12 | **缺少错误恢复 (Error Recovery) 设计** | 🟡 严重 | 补充 max_tokens 升级、reactive compact、指数退避重试等错误恢复模式 | 本文 §2.1、[Phase 1](phase-1-mvp.md) §6 |
 
 ---
 
@@ -276,8 +330,8 @@ Phase 1: Agent MVP (ReAct + Tool Calling)
 | 考点 | 涉及 Phase | 详见 |
 |------|-----------|------|
 | ReAct vs Chain-of-Thought | Phase 1-2 | [Phase 1](phase-1-mvp.md) §9 |
-| Tool Calling 实现原理 | Phase 2 | [Phase 2](phase-2-tool-calling.md) §9 |
-| Agent Runtime 核心循环 | Phase 3 | [Phase 3](phase-3-langgraph-workflow.md) §9 |
+| Anthropic Tool Use 实现原理 | Phase 2 | [Phase 2](phase-2-tool-calling.md) §9 |
+| Agent Runtime 核心循环 (stop_reason + block.type) | Phase 3 | [Phase 3](phase-3-langgraph-workflow.md) §9 |
 | LangGraph StateGraph 设计 | Phase 3 | [Phase 3](phase-3-langgraph-workflow.md) §9 |
 | Conditional Edge 应用 | Phase 3, 7 | [Phase 3](phase-3-langgraph-workflow.md), [Phase 7](phase-7-multi-agent.md) |
 | Short/Long/Reflection Memory | Phase 6 | [Phase 6](phase-6-memory-system.md) §9 |
@@ -311,8 +365,9 @@ Phase 1: Agent MVP (ReAct + Tool Calling)
 
 | 维度 | Claude Code (实际) | 本项目 |
 |------|-------------------|--------|
-| Agent Runtime | 自研 ReAct Loop | LangGraph StateGraph + 自研 Loop |
-| 工具系统 | 自研 Tool Registry | 自研 Tool Registry + MCP |
+| Agent Runtime | 自研 ReAct Loop (Anthropic SDK) | 相同：Anthropic SDK 原生调用 + LangGraph StateGraph |
+| 工具系统 | 自研 Tool Registry (Anthropic 原生格式) | 相同：Anthropic `input_schema` 格式 + MCP 扩展 |
+| LLM 调用 | `client.messages.create()` 原生 | 相同：无 LangChain 中间层，直接 Anthropic SDK |
 | 安全模型 | Permission System | Human-in-the-Loop |
 | Memory | 会话级上下文管理 | ChromaDB 持久化 + Token 管理 |
 | 多 Agent | 单 Agent 多工具 | 多 Agent 协作（差异化亮点） |

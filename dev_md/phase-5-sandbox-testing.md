@@ -387,10 +387,10 @@ class FixLoop:
                          (循环直到测试通过或达到最大次数)
     """
     
-    def __init__(self, docker_runner, llm, max_attempts: int = 3):
+    def __init__(self, docker_runner, client, max_attempts: int = 3):
         self.test_runner = PytestRunner(docker_runner)
         self.error_parser = ErrorParser()
-        self.llm = llm
+        self.client = client  # Anthropic 原生客户端，非 LangChain llm 对象
         self.max_attempts = max_attempts
     
     async def fix_and_retest(self, test_path: str, source_code: str, 
@@ -428,7 +428,14 @@ class FixLoop:
             Only output the fixed code, no explanation.
             """
             
-            fixed_code = await self.llm.ainvoke(fix_prompt)
+            # Anthropic 原生调用（不含工具——Fix Loop 只做代码修复）
+            response = self.client.messages.create(
+                model=MODEL,
+                system="You are a code fixer. Output only the fixed code, no explanation.",
+                messages=[{"role": "user", "content": fix_prompt}],
+                max_tokens=8192,
+            )
+            fixed_code = extract_text(response.content)
             
             # 5. 应用修复（通过 Phase 4 的 Diff/Patch 机制）
             patch_result = apply_patch(fixed_code, source_code)
