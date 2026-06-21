@@ -480,8 +480,8 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://joyagent:joyagent@db:5432/joyagent
       - REDIS_URL=redis://redis:6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL}
     depends_on:
       - db
       - redis
@@ -543,67 +543,85 @@ async def run_benchmark(agent) -> dict:
 
 ```python
 async def agent_runtime_with_permissions(user_input, state, session_id):
-    messages = state.messages + [HumanMessage(content=user_input)]
+    # Anthropic 原生格式：messages 是纯 dict 列表
+    messages = list(state.messages)  # 浅拷贝
+    messages.append({"role": "user", "content": user_input})
     perm_manager = PermissionManager()
-    
+    client = get_or_create_client()
+
     while state.iterations < state.max_iterations:
-        response = await llm.ainvoke(messages)
-        messages.append(response)
-        
-        if response.tool_calls:
-            for tc in response.tool_calls:
-                # ⬇ Human-in-the-Loop 检查
-                permission = perm_manager.check(tc["name"], tc["args"])
-                
-                if permission == PermissionLevel.DENY:
-                    messages.append(ToolMessage(
-                        content=f"Operation denied for security reasons: {tc['name']}",
-                        tool_call_id=tc["id"],
-                    ))
-                    await log_streamer.broadcast(session_id, {
-                        "type": "tool_denied",
-                        "data": {"tool": tc["name"], "reason": "Security policy"}
+        response = client.messages.create(
+            model=MODEL, system=SYSTEM_PROMPT,
+            messages=messages, tools=TOOLS, max_tokens=4096,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+
+        if response.stop_reason != "tool_use":
+            return {"response": extract_text(response.content)}
+
+        tool_results = []
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+
+            # ⬇ Human-in-the-Loop 检查
+            permission = perm_manager.check(block.name, block.input)
+
+            if permission == PermissionLevel.DENY:
+                tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.id,
+                    "content": f"Operation denied for security reasons: {block.name}",
+                })
+                await log_streamer.broadcast(session_id, {
+                    "type": "tool_denied",
+                    "data": {"tool": block.name, "reason": "Security policy"}
+                })
+                continue
+
+            elif permission == PermissionLevel.CONFIRM:
+                approval = await perm_manager.request_approval(
+                    ApprovalRequest(
+                        request_id=str(uuid4()),
+                        tool_name=block.name,
+                        tool_args=block.input,
+                        risk_level="medium",
+                        reason=f"Tool '{block.name}' requires user confirmation",
+                    ),
+                    session_id,
+                )
+                if not approval.approved:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": f"User denied execution of {block.name}",
                     })
                     continue
-                
-                elif permission == PermissionLevel.CONFIRM:
-                    approval = await perm_manager.request_approval(
-                        ApprovalRequest(
-                            request_id=str(uuid4()),
-                            tool_name=tc["name"],
-                            tool_args=tc["args"],
-                            risk_level="medium",
-                            reason=f"Tool '{tc['name']}' requires user confirmation",
-                        ),
-                        session_id,
-                    )
-                    if not approval.approved:
-                        messages.append(ToolMessage(
-                            content=f"User denied execution of {tc['name']}",
-                            tool_call_id=tc["id"],
-                        ))
-                        continue
-                
-                # 执行工具
-                result = await tool_registry.execute(tc["name"], **tc["args"])
-                messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
-                
-                # 记录到 TaskLog
-                await task_log_repo.create(TaskLog(
-                    session_id=session_id,
-                    event_type="tool_call",
-                    tool_name=tc["name"],
-                    tool_args=tc["args"],
-                    tool_success=result.success,
-                ))
-                
-                # WebSocket 实时推送
-                await log_streamer.broadcast(session_id, {
-                    "type": "tool_result",
-                    "data": {"tool": tc["name"], "success": result.success}
-                })
-        else:
-            return {"response": response.content}
+
+            # 执行工具
+            result = await tool_registry.execute(block.name, **block.input)
+            tool_results.append({
+                "type": "tool_result",
+                "tool_use_id": block.id,
+                "content": str(result),
+            })
+
+            # 记录到 TaskLog（数据库审计）
+            await task_log_repo.create(TaskLog(
+                session_id=session_id,
+                event_type="tool_call",
+                tool_name=block.name,
+                tool_args=block.input,
+                tool_success=result.success if hasattr(result, 'success') else True,
+            ))
+
+            # WebSocket 实时推送
+            await log_streamer.broadcast(session_id, {
+                "type": "tool_result",
+                "data": {"tool": block.name, "success": True}
+            })
+
+        messages.append({"role": "user", "content": tool_results})
 ```
 
 ---

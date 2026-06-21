@@ -108,14 +108,12 @@ class MCPTool:
     parameters: dict               # JSON Schema
     server_name: str               # 来自哪个 MCP Server
     
-    def to_openai_schema(self) -> dict:
+    def to_schema(self) -> dict:
+        """转为 Anthropic 原生工具格式"""
         return {
-            "type": "function",
-            "function": {
-                "name": f"{self.server_name}__{self.name}",  # 加前缀防冲突
-                "description": f"[{self.server_name}] {self.description}",
-                "parameters": self.parameters,
-            }
+            "name": f"{self.server_name}__{self.name}",  # 加前缀防冲突
+            "description": f"[{self.server_name}] {self.description}",
+            "input_schema": self.parameters,
         }
 
 @dataclass

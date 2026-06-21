@@ -454,8 +454,9 @@ async def modify_code_with_understanding(request: str, repo: RepoContext) -> Pat
     searcher = CodeSearcher(repo)
     analyzer = ASTAnalyzer()
     
-    # 用 LLM 从需求中提取搜索关键词
+    # 用 LLM（Anthropic 原生调用）从需求中提取搜索关键词
     search_terms = await llm_extract_search_terms(request)
+    # 内部使用 client.messages.create(max_tokens=256) 而非 langchain llm.ainvoke()
     matches = searcher.search_by_pattern(search_terms.pattern)
     
     # Step 3: 读取相关文件 + AST 分析
