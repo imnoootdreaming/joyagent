@@ -50,11 +50,12 @@ uv add docker pytest
 app/
 ├── sandbox/
 │   ├── __init__.py
-│   ├── docker_runner.py       # Docker 容器管理（创建/运行/销毁）
-│   ├── security.py            # 安全配置（资源限制、权限、网络）
-│   ├── pytest_runner.py       # pytest 测试执行 + 结果解析
-│   ├── error_parser.py        # 错误信息结构化解析
-│   └── fix_loop.py            # Fix Loop：错误 → 修复 → 重试
+│   ├── docker_runner.py         # Docker 容器管理（创建/运行/销毁）
+│   ├── security.py              # 安全配置（资源限制、权限、网络）
+│   ├── pytest_runner.py         # pytest 测试执行 + 结果解析
+│   ├── error_parser.py          # 错误信息结构化解析
+│   ├── fix_loop.py              # Fix Loop：错误 → 修复 → 重试
+│   └── bad_case_analyzer.py     # Bad Case 收集与分析（新增）
 │
 ├── sandbox_config/
 │   ├── Dockerfile             # 沙箱镜像定义
@@ -456,7 +457,256 @@ class FixLoop:
         return state
 ```
 
-### Step 6：接入 LangGraph Workflow（30 分钟）
+### Step 5.5：Bad Case 收集与分析（1 小时）
+
+**设计目标：** 系统性收集 Fix Loop 失败的案例，结构化分析失败根因，驱动 Prompt 和 Skill 策略迭代优化。这是 Agent 从"能跑"到"跑得好"的关键基础设施。
+
+**`app/sandbox/bad_case_analyzer.py`：**
+
+```python
+from dataclasses import dataclass, field
+from collections import defaultdict
+from app.sandbox.error_parser import TestFailure, ErrorParser
+from app.sandbox.fix_loop import FixLoopState
+
+
+@dataclass
+class BadCase:
+    """单个 Bad Case 记录"""
+    task_description: str          # 用户原始任务描述
+    task_category: str             # 任务类别：crud | algorithm | file_op | api_dev
+    failures: list[TestFailure]    # 解析后的测试失败列表
+    error_categories: list[str]    # 按 ErrorParser.categorize_error() 分类
+    fix_attempts: int              # Fix Loop 尝试次数
+    final_state: str               # "exhausted" | "timeout" | "gave_up"
+    source_code: str               # 最后一次修复后的代码（供分析）
+    timestamp: str = ""
+
+
+class BadCaseAnalyzer:
+    """Bad Case 分析引擎。
+    
+    分析流水线：
+    1. 收集：Fix Loop 失败 → 自动创建 BadCase 记录
+    2. 聚合：按错误类型 + 任务类别交叉聚合
+    3. 诊断：定位高频失败模式，识别可疑 Prompt 段
+    4. 输出：生成分析报告 + 改进建议
+    """
+    
+    def __init__(self):
+        self.cases: list[BadCase] = []
+        self._error_parser = ErrorParser()
+    
+    # ─── 1. 收集 ──────────────────────────────────
+    
+    def collect(self, task: str, category: str, fix_state: FixLoopState,
+                source_code: str, stderr: str) -> BadCase:
+        """从 FixLoopState 中提取 Bad Case。
+        
+        调用时机：FixLoopState.should_escalate() == True 时
+        """
+        failures = self._error_parser.parse(stderr)
+        error_cats = [self._error_parser.categorize_error(f) for f in failures]
+        
+        case = BadCase(
+            task_description=task,
+            task_category=category,
+            failures=failures,
+            error_categories=error_cats,
+            fix_attempts=fix_state.current_attempt,
+            final_state=self._determine_final_state(fix_state),
+            source_code=source_code,
+        )
+        self.cases.append(case)
+        return case
+    
+    # ─── 2. 聚合分析 ──────────────────────────────
+    
+    def aggregate_by_error_type(self) -> dict:
+        """按错误类型聚合"""
+        by_type = defaultdict(list)
+        for case in self.cases:
+            for cat in case.error_categories:
+                by_type[cat].append(case)
+        return dict(by_type)
+    
+    def aggregate_by_task_category(self) -> dict:
+        """按任务类别聚合"""
+        by_cat = defaultdict(list)
+        for case in self.cases:
+            by_cat[case.task_category].append(case)
+        return dict(by_cat)
+    
+    def cross_aggregate(self) -> dict:
+        """交叉聚合：任务类别 × 错误类型"""
+        matrix = defaultdict(lambda: defaultdict(int))
+        for case in self.cases:
+            for cat in case.error_categories:
+                matrix[case.task_category][cat] += 1
+        return {k: dict(v) for k, v in matrix.items()}
+    
+    # ─── 3. 诊断 ──────────────────────────────────
+    
+    @dataclass
+    class FailurePattern:
+        """高频失败模式"""
+        pattern_name: str            # 如 "CRUD 任务中的 ImportError"
+        task_category: str
+        error_type: str
+        frequency: int
+        ratio: float                 # 占同类任务的比例
+        example_cases: list[BadCase]
+    
+    def detect_patterns(self, min_frequency: int = 2) -> list[FailurePattern]:
+        """检测高频失败模式"""
+        cross = self.cross_aggregate()
+        total_by_cat = {
+            cat: len(cases) 
+            for cat, cases in self.aggregate_by_task_category().items()
+        }
+        
+        patterns = []
+        for task_cat, error_counts in cross.items():
+            for error_type, count in error_counts.items():
+                if count >= min_frequency:
+                    example = [
+                        c for c in self.cases
+                        if c.task_category == task_cat 
+                        and error_type in c.error_categories
+                    ][:3]
+                    patterns.append(self.FailurePattern(
+                        pattern_name=f"{task_cat} 任务中的 {error_type} 错误",
+                        task_category=task_cat,
+                        error_type=error_type,
+                        frequency=count,
+                        ratio=count / total_by_cat[task_cat],
+                        example_cases=example,
+                    ))
+        
+        return sorted(patterns, key=lambda p: p.frequency, reverse=True)
+    
+    # ─── 4. 报告生成 ──────────────────────────────
+    
+    def generate_report(self) -> str:
+        """生成分析报告（供开发者阅读，也可摘要后喂给 LLM）"""
+        total = len(self.cases)
+        if total == 0:
+            return "No bad cases collected yet."
+        
+        patterns = self.detect_patterns()
+        
+        report = f"""
+╔══════════════════════════════════════════════════════════╗
+║              Bad Case 分析报告                            ║
+╠══════════════════════════════════════════════════════════╣
+║  总 Bad Case 数: {total:<43d}║
+║  按错误类型分布:                                          ║
+"""
+        for err_type, cases in self.aggregate_by_error_type().items():
+            report += f"║    {err_type:20s}: {len(cases):>4d}  ({len(cases)/total*100:5.1f}%){' ' * (30 - len(err_type))}║\n"
+        
+        report += f"""╠══════════════════════════════════════════════════════════╣
+║  Top 失败模式:                                             ║
+"""
+        for i, p in enumerate(patterns[:5], 1):
+            report += f"║  {i}. {p.pattern_name[:45]:45s} ║\n"
+            report += f"║     发生 {p.frequency} 次 (占同类任务 {p.ratio*100:.0f}%){' ' * (30 - len(str(p.frequency)))}║\n"
+        
+        report += f"""╠══════════════════════════════════════════════════════════╣
+║  改进建议:                                                 ║
+"""
+        suggestions = self._generate_suggestions(patterns)
+        for s in suggestions:
+            report += f"║  • {s[:50]:50s} ║\n"
+        
+        report += "╚══════════════════════════════════════════════════════════╝"
+        return report
+    
+    def _generate_suggestions(self, patterns: list[FailurePattern]) -> list[str]:
+        """根据失败模式生成改进建议"""
+        suggestions = []
+        for p in patterns[:5]:
+            if p.error_type == "import":
+                suggestions.append(
+                    f"Prompt 增加依赖声明提示：在生成代码前先列出所需 import"
+                )
+            elif p.error_type == "assertion":
+                suggestions.append(
+                    f"Prompt 增加输出格式约束：明确期望的返回值类型和边界条件"
+                )
+            elif p.error_type == "syntax":
+                suggestions.append(
+                    f"考虑增加语法检查步骤：代码生成后先 compile() 检查再写入文件"
+                )
+            elif p.error_type == "runtime":
+                suggestions.append(
+                    f"Prompt 增加异常处理模板：要求生成的代码包含 try/except 关键路径"
+                )
+        if len(patterns) >= 3:
+            suggestions.append(
+                f"建议收集 ≥50 个 Bad Case 后做一次系统性 Prompt Review"
+            )
+        return suggestions
+    
+    # ─── 辅助 ──────────────────────────────────────
+    
+    def _determine_final_state(self, state: FixLoopState) -> str:
+        if state.current_attempt >= state.max_attempts:
+            return "exhausted"
+        if state.test_results and state.test_results[-1].errors > 0:
+            return "gave_up"
+        return "timeout"
+
+
+# 全局单例
+bad_case_analyzer = BadCaseAnalyzer()
+```
+
+**集成到 Fix Loop 中（修改 `fix_loop.py`）：**
+
+```python
+async def fix_and_retest(self, task_description: str, task_category: str,
+                         test_path: str, source_code: str) -> FixLoopState:
+    state = FixLoopState(max_attempts=self.max_attempts)
+    
+    while state.should_continue():
+        # ... 原有测试 → 修复逻辑 ...
+    
+    # Fix Loop 结束后，检查是否需要收集 Bad Case
+    if state.should_escalate():
+        bad_case_analyzer.collect(
+            task=task_description,
+            category=task_category,
+            fix_state=state,
+            source_code=source_code,
+            stderr=last_stderr,
+        )
+        # 日志提示：可调用 bad_case_analyzer.generate_report() 查看分析
+    
+    return state
+```
+
+**与 Memory 系统联动预留（Phase 6）：**
+
+```python
+# Phase 6 接入点（在 bad_case_analyzer.py 中预留）
+async def sync_to_long_term_memory(self):
+    """将 Bad Case 同步到 ChromaDB，支持相似失败模式检索"""
+    for case in self.cases:
+        embedding = await generate_embedding(case.task_description)
+        await chroma_collection.add(
+            ids=[case.task_description[:64]],
+            embeddings=[embedding],
+            metadatas=[{
+                "type": "bad_case",
+                "task_category": case.task_category,
+                "error_categories": ",".join(case.error_categories),
+                "fix_attempts": case.fix_attempts,
+            }],
+        )
+```
+
+**面试要点：** 面试官问"你怎么优化 Agent 的表现"时，这套 Bad Case 分析流程就是你的回答主线——不是玄学调参，而是数据驱动的系统性方法。
 - 在 LangGraph 的 Executor Node 中，代码生成后调用 Fix Loop
 - 新增 Sandbox Node，在 Reflector 之前执行测试
 
@@ -539,6 +789,10 @@ START
 - [ ] Error Parser 能提取文件路径、行号、错误类型
 - [ ] Fix Loop 能在最多 3 轮内修复简单错误
 - [ ] 整个流程：代码生成 → 测试 → 修复 → 再测试 → 通过
+- [ ] Bad Case 收集：Fix Loop 失败后自动创建 BadCase 记录
+- [ ] Bad Case 分析：`aggregate_by_error_type()` / `cross_aggregate()` 正常输出
+- [ ] 失败模式检测：`detect_patterns()` 能识别高频失败模式
+- [ ] 分析报告：`generate_report()` 输出格式化的改进建议
 
 ### 自测用例
 
@@ -599,3 +853,5 @@ curl -X POST /api/chat -d '{
 | **如何限制 Agent 权限？** | 技术上：Docker 安全配置；流程上：Human-in-the-Loop（Phase 9）；设计上：工具分级（is_dangerous 标记，Phase 2）。 | §6.1 |
 | **Fix Loop 的退出策略？** | max_attempts=3 后升级到用户介入；连续相同错误 → 可能是设计问题，不应无限重试；Token 预算耗尽 → 止损机制。 | §4.3, §6.2 |
 | **如何处理不同类型的测试失败？** | 分类处理：Syntax/Import → 直接修复代码；Assertion → 分析逻辑差异；Runtime → 检查上下文和依赖。不同类别不同 Prompt。 | §5 Step 4 |
+| **如何系统性地优化 Agent 表现？** | 不靠玄学调参。数据驱动闭环：收集 Fix Loop 失败的 Bad Case → 按错误类型 × 任务类别交叉聚合 → 定位高频失败模式 → 针对性改进 Prompt/Tool Skill → Benchmark 回归验证完成率是否提升。这是 Production AI 系统的核心方法论。 | §5 Step 5.5 |
+| **Bad Case 分析的具体维度？** | 1) 错误类型维度（syntax/import/assertion/runtime）；2) 任务类别维度（CRUD/算法/文件操作/API 开发）；3) 交叉维度（如"CRUD 任务中的 ImportError 高频"）；4) 时序维度（新 Prompt 版本后是否改善）。 | §5 Step 5.5 |
