@@ -9,13 +9,13 @@ class ToolRegistry:
     def __init__(self):
         self._tools : dict[str, BaseTool] = {}
 
-    def register_tool(self, tool: BaseTool) -> str:
+    def register_tool(self, tool: BaseTool) -> ToolResult:
         """Register a tool in the registry."""
         if tool.name in self._tools:
-            return f"Tool: '{tool.name}' is already registered."
+            return ToolResult(success=False, message="", error=f"Tool: '{tool.name}' is already registered.")
         self._tools[tool.name] = tool
-        return f"Tool: '{tool.name}' registered successfully."
-    
+        return ToolResult(success=True, message=f"Tool: '{tool.name}' registered successfully.", error=None)
+
     def get_tool(self, tool_name: str) -> BaseTool:
         """Retrieve a tool from the registry by name."""
         return self._tools.get(tool_name, None)
