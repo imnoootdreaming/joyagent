@@ -2,6 +2,7 @@
 # 无需 OpenAI Function Calling 的 "type": "function" 包装层
 from app.tools.file_read import read_file
 from app.tools.file_write import write_file
+""" Already Deprecated """
 
 READ_FILE_TOOL = {
     "name": "read_file",
