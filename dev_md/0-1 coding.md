@@ -14,12 +14,14 @@
 - 基于 LangGraph StateGraph 构建 Agent Workflow，设计 Planner、Coder、Reviewer、Tester 多节点协作图，实现复杂任务拆解与状态流转，⽀持条件路由（Conditional Edge）实现⾮线性任务执⾏。
 - 基于 Anthropic Messages API 原生 Tool Use 实现 Agent Runtime，支持文件系统、Shell、Git、Web Search 等 10+ 工具动态编排，采用 stop_reason + block.type 模式判断工具调用。
 - 设计 Short-term Memory（滑动窗口 + 摘要压缩）、Long-term Memory（ChromaDB 向量检索）与 Reflection Memory（错误嵌入 + 相似经验召回），实现会话摘要、上下文压缩及任务状态持久化。
+- 设计 Tool Call Hook 中间件机制，基于 on_pre_execute / on_post_execute / on_error 生命周期拦截实现工具调用全链路追踪，支持调用频率、成功率、P50/P99 耗时等多维度实时统计，构建 Agent 行为可观测性体系。
 - 基于 MCP 协议实现插件体系，集成官方 GitHub MCP Server、PostgreSQL MCP Server，并自建 1 个 Demo MCP Server 展示协议理解。
 - 基于 Docker Sandbox 构建安全代码执⾏环境，实现 CPU/内存/网络全限制 + 只读文件挂载，防容器逃逸。
+- 构建 Bad Case 自动分析流水线：收集 Fix Loop 失败案例 → 按错误类型（语法/导入/断言/运行时）与任务类别聚合 → 定位高频失败模式 → 驱动 Prompt 与 Tool Skill 策略迭代优化，形成"评估 → 分析 → 优化 → 回归"的数据驱动 Agent 能力提升闭环。
 - 利用 Redis 实现任务队列与状态管理，通过 Human-in-the-Loop 权限控制实现危险操作审批。
 - 支持 Multi-Agent 协同执⾏，通过条件路由（Conditional Routing）与反思机制（Reflection）提升复杂任务完成率。
 - 基于 FastAPI + WebSocket 实现实时日志流与任务监控，支持多用户并发执行 Agent 工作流。
-- 在自建 10 个编程任务 Benchmark 上任务完成率达 XX%。
+- 自建 10 个编程任务 Benchmark（覆盖 CRUD 生成、算法实现、文件操作、API 开发等场景），通过 Bad Case 回溯 + Prompt 迭代将任务完成率从初始 XX% 提升至 YY%，验证数据驱动优化方法论有效性。
 
 ---
 

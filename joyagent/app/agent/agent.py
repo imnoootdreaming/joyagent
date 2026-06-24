@@ -1,7 +1,8 @@
 from app.agent.prompt import SYSTEM_PROMPT
 from app.service.llm_service import get_or_create_client
-from app.tools.schemas import TOOLS, TOOL_HANDLERS
+from app.tools.registry import tool_registry
 from app.core.config import Config
+from app.tools.base import ToolResult
 
 # ── Agent 核心循环常量 ──
 DEFAULT_MAX_TOKENS = 4096
@@ -15,7 +16,8 @@ CONTINUATION_PROMPT = (
 
 class RecoveryState:
     """
-    Trace for max_tokens recovery attempts, recovery times and compact attempts within a single agent_loop execution.
+    Trace for max_tokens recovery attempts, recovery times and compact attempts
+    within a single agent_loop execution.
     """
 
     def __init__(self):
@@ -26,7 +28,9 @@ class RecoveryState:
 
 class Agent:
     """
-    Autonomous coding agent — Anthropic style ReAct Loop
+    Autonomous coding agent — Anthropic style ReAct Loop.
+
+    Phase 2: 使用 ToolRegistry 统一管理工具（替代 Phase 1 硬编码 TOOLS/TOOL_HANDLERS）。
     """
 
     def __init__(self, model_name: str = None):
@@ -34,18 +38,24 @@ class Agent:
         self.client = get_or_create_client(self.model_name)
         self.max_iterations = Config.MAX_ITERATIONS
 
-    async def agent_loop(self, user_message: str, history: list = None) -> dict:
-        """ 
-        Core（Anthropic style）：
+    async def agent_loop(self, user_message: str, context: list = None) -> dict:
+        """
+        Core ReAct Loop（Anthropic native style）：
+
             while stop_reason == "tool_use":
                 response = client.messages.create(messages, tools)
-                tool_results = execute_tools(response.content)
+                tool_results = execute_via_registry(response.content)
                 messages.append({"role": "user", "content": tool_results})
+
+        Phase 2 变化：
+          - tools:        tool_registry.get_tool_schemas() 替代硬编码 TOOLS
+          - 工具执行:      tool_registry.execute(name, **input) 替代 TOOL_HANDLERS
+          - is_dangerous:  危险工具执行时打印黄色警告日志
         """
         # 构建消息历史（纯 dict，非 LangChain 对象）
         messages = []
-        if history:
-            messages.extend(history)
+        if context:
+            messages.extend(context)
         messages.append({"role": "user", "content": user_message})
 
         iterations = 0
@@ -62,11 +72,10 @@ class Agent:
                     model=self.model_name,
                     system=SYSTEM_PROMPT,       # system 是独立参数
                     messages=messages,           # 纯 dict 列表
-                    tools=TOOLS,                 # Anthropic 原生工具格式
+                    tools=tool_registry.get_tool_schemas(),  # ⬅ Phase 2: Registry
                     max_tokens=max_tokens,
                 )
             except Exception as e:
-                # 简单错误处理（后续 Phase 补充完整 error recovery）
                 return {
                     "response": f"[Error] {type(e).__name__}: {e}",
                     "tool_calls": tool_calls_made,
@@ -103,9 +112,8 @@ class Agent:
                     "iterations": iterations,
                 }
 
-            # ── 4. 检查该轮是否有工具调用（没有 tool_use 代表 LLM 看过了一切内容） ──
+            # ── 4. 检查 stop_reason：没有 tool_use → 任务完成 ──
             if response.stop_reason != "tool_use":
-                # 没有工具调用 → 模型认为任务完成
                 text_output = ""
                 for block in response.content:
                     if block.type == "text":
@@ -117,33 +125,47 @@ class Agent:
                     "iterations": iterations,
                 }
 
-            # ── 5. 执行工具调用 ──
+            # ── 5. 执行工具调用（Phase 2: 统一通过 ToolRegistry） ──
             tool_results = []
             for block in response.content:
                 if block.type != "tool_use":
                     continue
 
                 tool_name = block.name
-                tool_input = block.input  # Anthropic 用 .input，不是 .args
+                tool_input = block.input  # Anthropic 用 .input，不是 ["args"]
 
-                # 查找并执行 handler
-                handler = TOOL_HANDLERS.get(tool_name)
-                if handler:
-                    result = handler(**tool_input)
+                # ── 5a. is_dangerous 检查（Phase 2: 打黄色警告日志） ──
+                tool = tool_registry.get_tool(tool_name)
+                if tool and tool.is_dangerous:
+                    print(
+                        f"  \033[33m[!] dangerous {tool_name}("
+                        f"{_format_args(tool_input)}) — requires confirmation\033[0m"
+                    )
+
+                # ── 5b. 通过 Registry 执行工具 ──
+                result = await tool_registry.execute(tool_name, **tool_input)
+                if isinstance(result, ToolResult):
+                    # 成功/失败都从 ToolResult 提取 LLM 可读文本
+                    content_for_llm = (
+                        result.message if result.success
+                        else f"Error: {result.error or result.message}"
+                    )
                 else:
-                    result = f"Error: Unknown tool '{tool_name}'"
+                    # 未知工具降级（ToolRegistry 返回带 error 的 ToolResult，一般不会到这）
+                    content_for_llm = str(result)
 
+                # ── 5c. 记录工具调用（供 API 返回和日志审计） ──
                 tool_calls_made.append({
                     "tool": tool_name,
                     "input": tool_input,
-                    "result": str(result)[:500],
+                    "result": content_for_llm[:500],
                 })
 
-                # 构造 Anthropic 格式的 tool_result
+                # ── 5d. 构造 Anthropic 格式的 tool_result ──
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
-                    "content": str(result),
+                    "content": content_for_llm,
                 })
 
             # ── 6. 工具结果作为 user 消息追加，循环继续 ──
@@ -155,3 +177,17 @@ class Agent:
             "tool_calls": tool_calls_made,
             "iterations": iterations,
         }
+
+
+def _format_args(kwargs: dict, max_len: int = 80) -> str:
+    """格式化工具参数为简短字符串（用于日志输出）。"""
+    parts = []
+    for k, v in kwargs.items():
+        s = str(v)
+        if len(s) > 40:
+            s = s[:37] + "..."
+        parts.append(f"{k}={s}")
+    joined = ", ".join(parts)
+    if len(joined) > max_len:
+        joined = joined[:max_len - 3] + "..."
+    return joined

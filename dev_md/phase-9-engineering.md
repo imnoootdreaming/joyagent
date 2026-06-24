@@ -508,32 +508,261 @@ volumes:
   redisdata:
 ```
 
-### 9B-2：Benchmark 评估系统（可选）
+### 9B-2：Benchmark 评估系统 + Bad Case 回归（1 小时）
+
+**设计目标：** 建立自动化的 Agent 能力评估体系，确保每次 Prompt/Skill 变更都有量化数据支撑，防止回归。
 
 ```python
-# 自建 10 个编程任务作为 Benchmark
-BENCHMARK_TASKS = [
-    {"task": "创建 calculator.py，包含 add/subtract/multiply/divide", 
-     "expected_files": ["calculator.py"],
-     "test": "pytest test_calculator.py --json-report"},
+# ─── Benchmark 任务定义 ──────────────────────────
 
-    {"task": "创建 FastAPI User CRUD API", 
-     "expected_files": ["app.py", "models.py", "requirements.txt"],
-     "test": "pytest test_api.py --json-report"},
-    # ... 10 个任务
+# 自建 10 个编程任务作为 Benchmark（覆盖典型场景）
+BENCHMARK_TASKS = [
+    {
+        "id": "calc-01",
+        "task": "创建 calculator.py，包含 add/subtract/multiply/divide",
+        "category": "algorithm",
+        "expected_files": ["calculator.py"],
+        "test": "pytest test_calculator.py --json-report",
+    },
+    {
+        "id": "crud-01",
+        "task": "创建 User CRUD API，包含 create/read/update/delete 四个端点",
+        "category": "crud",
+        "expected_files": ["app.py", "models.py", "requirements.txt"],
+        "test": "pytest test_api.py --json-report",
+    },
+    {
+        "id": "file-01",
+        "task": "读取 data.csv 文件，计算每一列的均值和中位数，结果写入 summary.json",
+        "category": "file_op",
+        "expected_files": ["process.py", "summary.json"],
+        "test": "pytest test_process.py --json-report",
+    },
+    # ... 共 10 个任务（覆盖 crud / algorithm / file_op / api_dev 四类场景）
 ]
 
-async def run_benchmark(agent) -> dict:
-    """运行 Benchmark 评估"""
-    results = []
-    for task in BENCHMARK_TASKS:
-        result = await agent.chat(task["task"])
-        passed = verify_task(task, result)
-        results.append({"task": task["task"], "passed": passed})
+
+# ─── Prompt 版本管理 ──────────────────────────────
+
+@dataclass
+class PromptVersion:
+    """Prompt 版本记录"""
+    version: str                  # "v1.0.0"
+    system_prompt_hash: str       # SHA256 of system prompt
+    skill_prompts_hash: dict      # {skill_name: sha256}
+    benchmark_pass_rate: float    # Benchmark 完成率
+    created_at: str
+
+
+class PromptVersionManager:
+    """Prompt 版本管理器。
     
-    pass_rate = sum(1 for r in results if r["passed"]) / len(results)
-    return {"results": results, "pass_rate": pass_rate}
+    核心原则：每次 Prompt 变更必须跑 Benchmark 并记录完成率。
+    新版本完成率低于旧版本 → 阻止上线。
+    """
+    
+    def __init__(self):
+        self.versions: list[PromptVersion] = []
+        self._min_pass_rate = 0.60  # 最低通过阈值
+    
+    def record_version(self, system_prompt: str, 
+                       skill_prompts: dict[str, str],
+                       benchmark_result: dict) -> PromptVersion:
+        """记录新的 Prompt 版本及其 Benchmark 结果"""
+        import hashlib
+        
+        version_num = len(self.versions) + 1
+        v = PromptVersion(
+            version=f"v{version_num}.0.0",
+            system_prompt_hash=hashlib.sha256(system_prompt.encode()).hexdigest()[:12],
+            skill_prompts_hash={
+                name: hashlib.sha256(p.encode()).hexdigest()[:12]
+                for name, p in skill_prompts.items()
+            },
+            benchmark_pass_rate=benchmark_result["pass_rate"],
+            created_at=datetime.datetime.utcnow().isoformat(),
+        )
+        self.versions.append(v)
+        return v
+    
+    def check_regression(self, current_v: PromptVersion, 
+                         previous_v: PromptVersion) -> bool:
+        """检查是否发生回归（新版本完成率显著低于旧版本）"""
+        drop = previous_v.benchmark_pass_rate - current_v.benchmark_pass_rate
+        return drop > 0.10  # 完成率下降 >10% 视为回归
+    
+    def can_deploy(self, v: PromptVersion) -> tuple[bool, str]:
+        """判断此版本能否上线"""
+        if v.benchmark_pass_rate < self._min_pass_rate:
+            return False, f"完成率 {v.benchmark_pass_rate:.1%} 低于阈值 {self._min_pass_rate:.1%}"
+        if len(self.versions) >= 2:
+            prev = self.versions[-2]
+            if self.check_regression(v, prev):
+                return False, f"完成率从 {prev.benchmark_pass_rate:.1%} 降至 {v.benchmark_pass_rate:.1%}（回归）"
+        return True, "OK"
+
+
+# ─── Bad Case 回放测试 ────────────────────────────
+
+@dataclass
+class RegressionTest:
+    """单个回归测试 = 曾失败的历史 Bad Case"""
+    case_id: str
+    task_description: str
+    task_category: str
+    original_error: str           # 原始失败原因
+    fix_prompt_version: str       # 修复后的 Prompt 版本
+    expected_pass: bool = True    # 期望在新 Prompt 下通过
+
+
+class BadCaseRegressionRunner:
+    """Bad Case 回放测试执行器。
+    
+    流程：
+    1. 从 BadCaseAnalyzer（Phase 5）加载所有已收集的 Bad Case
+    2. 用新 Prompt 版本重新执行每个 Bad Case 对应的任务
+    3. 对比新旧结果：修复了哪些？回归了哪些？
+    4. 输出回归测试报告
+    """
+    
+    def __init__(self, agent, benchmark_runner, 
+                 bad_case_analyzer: "BadCaseAnalyzer"):
+        self.agent = agent
+        self.benchmark = benchmark_runner
+        self.bad_cases = bad_case_analyzer
+    
+    async def run_regression(self, new_prompt_version: str) -> dict:
+        """对新 Prompt 版本执行回放测试"""
+        results = {
+            "version": new_prompt_version,
+            "total": 0,
+            "fixed": 0,          # 以前失败、现在通过
+            "still_failed": 0,   # 以前失败、现在仍失败
+            "regression": 0,     # 以前通过、现在失败（新引入的回归）
+            "details": [],
+        }
+        
+        for case in self.bad_cases.cases:
+            results["total"] += 1
+            
+            # 重新执行任务
+            result = await self.agent.chat(case.task_description)
+            passed = self._verify_result(result, case)
+            
+            detail = {
+                "case_id": case.final_state,
+                "task": case.task_description[:80],
+                "original_error": case.error_categories,
+                "new_result": "passed" if passed else "failed",
+            }
+            results["details"].append(detail)
+            
+            if passed:
+                results["fixed"] += 1       # ✅ 修复成功
+            else:
+                results["still_failed"] += 1  # ❌ 仍未修复
+        
+        # 检查是否有新引入的回归（对 Benchmark 任务集中之前通过的做对比）
+        # ... 
+        
+        results["fix_rate"] = results["fixed"] / results["total"] if results["total"] else 0
+        return results
+    
+    def _verify_result(self, result: dict, case: BadCase) -> bool:
+        """验证单个任务是否通过"""
+        return result.get("test_passed", False)
+    
+    def generate_regression_report(self, results: dict) -> str:
+        """生成回归测试报告"""
+        report = f"""
+╔══════════════════════════════════════════════════════════╗
+║           Bad Case 回归测试报告                            ║
+╠══════════════════════════════════════════════════════════╣
+║  Prompt 版本: {results['version']:<44s}║
+║  总回放数: {results['total']:>4d}                                         ║
+║  修复成功: {results['fixed']:>4d}  ({results.get('fix_rate', 0)*100:.0f}%)                                  ║
+║  仍未修复: {results['still_failed']:>4d}                                         ║
+║  新回归:   {results['regression']:>4d}                                         ║
+╚══════════════════════════════════════════════════════════╝
+"""
+        return report
+
+
+# ─── 完整评估流水线 ────────────────────────────────
+
+class AgentEvaluationPipeline:
+    """Agent 评估流水线：Benchmark → Bad Case 回归 → 上线判断"""
+    
+    def __init__(self, agent, benchmark_tasks, bad_case_analyzer,
+                 prompt_manager: PromptVersionManager):
+        self.agent = agent
+        self.tasks = benchmark_tasks
+        self.bad_case_runner = BadCaseRegressionRunner(
+            agent, None, bad_case_analyzer
+        )
+        self.prompt_mgr = prompt_manager
+    
+    async def evaluate(self, system_prompt: str,
+                       skill_prompts: dict[str, str]) -> dict:
+        """
+        完整评估流水线：
+        1. 运行 Benchmark → 获取 pass_rate
+        2. 运行 Bad Case 回归 → 检查修复率 + 是否有回归
+        3. 判断是否可以上线
+        """
+        # Step 1: Benchmark
+        benchmark_result = await self._run_benchmark()
+        
+        # Step 2: 记录 Prompt 版本
+        version = self.prompt_mgr.record_version(
+            system_prompt, skill_prompts, benchmark_result
+        )
+        
+        # Step 3: Bad Case 回归
+        regression_result = await self.bad_case_runner.run_regression(
+            version.version
+        )
+        
+        # Step 4: 上线判断
+        can_deploy, reason = self.prompt_mgr.can_deploy(version)
+        
+        return {
+            "version": version.version,
+            "benchmark": benchmark_result,
+            "regression": regression_result,
+            "can_deploy": can_deploy,
+            "reason": reason,
+        }
+    
+    async def _run_benchmark(self) -> dict:
+        """执行 Benchmark"""
+        results = []
+        for task in self.tasks:
+            result = await self.agent.chat(task["task"])
+            passed = self._verify_task(task, result)
+            results.append({"task_id": task["id"], "passed": passed})
+        
+        pass_rate = sum(1 for r in results if r["passed"]) / len(results)
+        return {"results": results, "pass_rate": pass_rate, "total": len(results)}
+    
+    def _verify_task(self, task: dict, result: dict) -> bool:
+        """验证单个 Benchmark 任务"""
+        return result.get("test_passed", False)
+
+
+# 评估流水线总结
+#
+# ┌─────────────┐    ┌──────────────┐    ┌──────────────┐    ┌─────────┐
+# │ 改 Prompt   │───▶│ Benchmark    │───▶│ Bad Case     │───▶│ 上线    │
+# │ 或 Skill    │    │ 10 题评估    │    │ 回放测试      │    │ 判断    │
+# └─────────────┘    └──────┬───────┘    └──────┬───────┘    └────┬────┘
+#                          │                   │                 │
+#                          ▼                   ▼                 ▼
+#                    pass_rate ≥ 60%     fix_rate ≥ 30%     can_deploy?
+#                           + 无回归           + 无新回归       + 记录版本
 ```
+
+**面试要点：** 这条完整展示了"如何衡量 AI Agent 好不好"和"如何让它变好"——大厂面试官最看重的数据驱动思维。Benchmark → Bad Case → 回归 → 上线判断的四步流水线，是 Production AI 系统的标准工程范式。
 
 ---
 
@@ -639,6 +868,9 @@ async def agent_runtime_with_permissions(user_input, state, session_id):
 ### 9B 完成（可选）
 - [ ] `docker compose up` 一键启动全栈
 - [ ] Benchmark 能自动运行并输出完成率
+- [ ] Prompt 版本管理：每次 Prompt 变更记录版本 + Benchmark 完成率
+- [ ] Bad Case 回放测试：新 Prompt 在历史 Bad Case 上跑回归
+- [ ] 上线判断：完成率低于阈值或发生回归时自动阻止上线
 
 ### 自测用例
 
@@ -701,3 +933,5 @@ curl -X POST /api/chat -d '{"message": "删除所有 .py 文件", "session_id": 
 | **Session 如何存储？** | PostgreSQL JSON 字段存储 AgentState（Plan、Messages Summary、Tool History）。启动时从 PG 恢复 State，同时从 ChromaDB 加载 Long-term Memory。 | §4.1, §5 (9A-1) |
 | **如何实现任务恢复？** | Checkpoint（LangGraph）+ Session 持久化（PG）+ Memory 持久化（ChromaDB）。三层状态都可恢复。 | §5 (9A-1), Phase 3 |
 | **如何扩展到多用户系统？** | 1) Session 隔离（每个用户独立 Session）2) Task Queue 排队 3) Docker Sandbox 每用户独立容器 4) PostgreSQL 多租户（user_id 过滤）。 | §4.1, §5 |
+| **如何评估 Agent 的能力？** | 不靠人工感觉。三层评估体系：1) Benchmark（10 题自动化评估，覆盖 CRUD/算法/文件/API 四类场景）→ pass_rate；2) Bad Case 回归（历史失败案例回放）→ fix_rate；3) Prompt 版本对比 → 防止回归。数据驱动，可重复，可追溯。 | §5 (9B-2) |
+| **怎么防止 Prompt 改坏？** | Prompt 版本管理 + 自动回归检查：每次变更记录 version + prompt_hash + pass_rate；新版本完成率下降 >10% 自动阻止上线；Bad Case 回放确保已修复的不再坏。 | §5 (9B-2) |
