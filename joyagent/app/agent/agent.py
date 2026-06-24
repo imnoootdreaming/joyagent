@@ -38,7 +38,7 @@ class Agent:
         self.client = get_or_create_client(self.model_name)
         self.max_iterations = Config.MAX_ITERATIONS
 
-    async def agent_loop(self, user_message: str, history: list = None) -> dict:
+    async def agent_loop(self, user_message: str, context: list = None) -> dict:
         """
         Core ReAct Loop（Anthropic native style）：
 
@@ -54,8 +54,8 @@ class Agent:
         """
         # 构建消息历史（纯 dict，非 LangChain 对象）
         messages = []
-        if history:
-            messages.extend(history)
+        if context:
+            messages.extend(context)
         messages.append({"role": "user", "content": user_message})
 
         iterations = 0
