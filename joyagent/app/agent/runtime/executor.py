@@ -203,7 +203,7 @@ async def executor_node(state: AgentState) -> dict:
     continuation_count = 0               # 续写次数计数
 
     # ── 2. 迷你 ReAct Loop（单步内最多 MAX_TOOL_ROUNDS_PER_STEP 轮） ───
-    for _ in range(MAX_TOOL_ROUNDS_PER_STEP):
+    for round_num in range(MAX_TOOL_ROUNDS_PER_STEP):
 
         # ── 2a. 调用 LLM ──────────────────────────────────────────────
         try:
