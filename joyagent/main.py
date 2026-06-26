@@ -1,8 +1,10 @@
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from app.api.agent import router as agent_router
 
 app = FastAPI(title="JoyAgent", version="0.1.0")
 app.include_router(agent_router)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
 @app.on_event("startup")

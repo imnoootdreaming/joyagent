@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>JoyAgent Workflow Monitor</title>
+<style>
+  body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
+  #log { white-space: pre-wrap; line-height: 1.6; }
+  .start  { color: #569cd6; }  /* 蓝 — Node 开始 */
+  .done   { color: #6a9955; }  /* 绿 — Node 完成 */
+  .route  { color: #dcdcaa; }  /* 黄 — 路由 */
+  .end    { color: #ce9178; }  /* 橙 — 结束 */
+  .error  { color: #f44747; }  /* 红 — 错误 */
+  #status { color: #4ec9b0; font-size: 14px; margin-bottom: 12px; }
+  h2 { color: #c586c0; }
+  input { padding: 6px 12px; margin-right: 8px; }
+  button { padding: 6px 16px; cursor: pointer; }
+</style>
+</head>
+<body>
+<h2>JoyAgent Workflow Monitor</h2>
+<p><input id="msg" value="列出当前目录的文件" size="50">
+   <button onclick="start()">发送</button></p>
+<p id="status">⚫ 未连接</p>
+<pre id="log"></pre>
+
+<script>
+let sessionId = crypto.randomUUID().slice(0, 12);
+
+function log(type, text) {
+  const el = document.getElementById("log");
+  el.innerHTML += `<span class="${type}">[${new Date().toLocaleTimeString()}] ${text}</span>\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+function start() {
+  document.getElementById("log").innerHTML = "";
+
+  // 1. 发 HTTP 请求触发工作流（不等待结果）
+  const msg = document.getElementById("msg").value;
+  fetch("/api/chat", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({message: msg, force_workflow: true, session_id: sessionId}),
+  });
+  log("start", `HTTP request sent: "${msg}"`);
+
+  // 2. 连 WebSocket 实时看 Node 进度
+  const wsUrl = `ws://${location.host}/api/ws/workflow/${sessionId}`;
+  const ws = new WebSocket(wsUrl);
+
+  ws.onopen = () => {
+    document.getElementById("status").innerText = "🟢 已连接 — 等待 Node 事件...";
+    log("start", "WebSocket connected");
+  };
+
+  ws.onmessage = (e) => {
+    const ev = JSON.parse(e.data);
+    switch (ev.type) {
+      case "node_start":
+        log("start", `▶ ${ev.node} 开始执行`);
+        break;
+      case "node_done":
+        log("done", `✓ ${ev.node} 完成 ${JSON.stringify(ev.data).slice(0, 200)}`);
+        break;
+      case "workflow_end":
+        log("end", `★ 工作流结束 — 完成 ${ev.completed_steps}/${ev.total_steps} 步`);
+        document.getElementById("status").innerText = "⚫ 工作流已结束";
+        ws.close();
+        break;
+      case "error":
+        log("error", `✗ 错误: ${JSON.stringify(ev)}`);
+        break;
+    }
+  };
+
+  ws.onclose = () => log("route", "WebSocket 断开");
+  ws.onerror = () => log("error", "WebSocket 连接失败");
+}
+</script>
+</body>
+</html>
