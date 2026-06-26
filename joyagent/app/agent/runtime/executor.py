@@ -137,6 +137,69 @@ def _format_args(kwargs: dict, max_len: int = 80) -> str:
     return joined
 
 
+def _content_to_dicts(content_blocks: list) -> list[dict]:
+    """
+    将 Anthropic SDK 的 content block 对象列表转为纯 dict 列表。
+
+    LangGraph 的 add_messages reducer 只能处理 dict 或 LangChain Message 对象，
+    无法处理 Anthropic SDK 的 ThinkingBlock / TextBlock / ToolUseBlock 等 Pydantic 对象。
+    此函数做一层转换，确保消息历史可以安全通过 LangGraph 的 state 流转。
+
+    转换映射：
+      ThinkingBlock(signature=..., thinking=..., type='thinking')
+        → {"type": "thinking", "thinking": "...", "signature": "..."}
+      TextBlock(text="...", type='text')
+        → {"type": "text", "text": "..."}
+      ToolUseBlock(id=..., name=..., input=..., type='tool_use')
+        → {"type": "tool_use", "id": "...", "name": "...", "input": {...}}
+    """
+    result = []
+    for block in content_blocks:
+        # 已经是 dict → 直接保留
+        if isinstance(block, dict):
+            result.append(block)
+            continue
+
+        # Anthropic SDK 对象 → 提取公共字段 type + 类型专属字段
+        block_type = getattr(block, 'type', 'unknown')
+
+        if block_type == 'text':
+            # TextBlock: 纯文本输出
+            result.append({
+                "type": "text",
+                "text": getattr(block, 'text', ''),
+            })
+        elif block_type == 'tool_use':
+            # ToolUseBlock: 工具调用请求
+            result.append({
+                "type": "tool_use",
+                "id": getattr(block, 'id', ''),
+                "name": getattr(block, 'name', ''),
+                "input": getattr(block, 'input', {}),
+            })
+        elif block_type == 'thinking':
+            # ThinkingBlock: Claude 的思考过程（保留供调试）
+            result.append({
+                "type": "thinking",
+                "thinking": getattr(block, 'thinking', ''),
+                "signature": getattr(block, 'signature', ''),
+            })
+        else:
+            # 未知类型 → 尽力保留所有非私有属性
+            fallback = {"type": block_type}
+            for attr in dir(block):
+                if not attr.startswith('_'):
+                    try:
+                        val = getattr(block, attr)
+                        if not callable(val):
+                            fallback[attr] = val
+                    except Exception:
+                        pass
+            result.append(fallback)
+
+    return result
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Executor Node 主函数（LangGraph Node 接口）
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -222,9 +285,10 @@ async def executor_node(state: AgentState) -> dict:
             }
 
         # ── 2b. 追加 assistant 回复到消息历史 ─────────────────────────
+        # 将 SDK content block 转为纯 dict（LangGraph add_messages 需要）
         messages.append({
             "role": "assistant",
-            "content": response.content,     # Anthropic 格式 content 列表
+            "content": _content_to_dicts(response.content),
         })
 
         # ── 2c. max_tokens 恢复（与 Phase 1-2 完全一致） ─────────────

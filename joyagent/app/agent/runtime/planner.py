@@ -66,35 +66,51 @@ def _load_planner_prompt() -> str:
     )
 
 
-def _extract_user_request(messages: list[dict]) -> str:
+def _extract_user_request(messages: list) -> str:
     """
     从 AgentState.messages 中提取用户原始请求文本。
 
-    messages 为 Anthropic 原生格式的 dict 列表：
-      {"role": "user", "content": "你好"}
-      {"role": "assistant", "content": [{"type": "text", "text": "..."}]}
-      {"role": "user", "content": [{"type": "tool_result", ...}]}
+    兼容两种消息格式（LangGraph 的 add_messages reducer 会将纯 dict 转为 LangChain 对象）：
+      A) LangChain HumanMessage（Pydantic 对象，有 .type / .content 属性）
+         HumanMessage(type="human", content="你好")
+      B) Anthropic 原生 dict（纯 Python dict）
+         {"role": "user", "content": "你好"}
+         {"role": "user", "content": [{"type": "text", "text": "..."}]}
 
-    策略：取第一条 user 消息的文本（通常就是用户输入）。
-    后续可扩展为拼接所有 user 消息以支持多轮对话。
+    策略：取第一条 user/human 消息的文本（通常就是用户输入）。
     """
     for msg in messages:
-        if msg.get("role") != "user":
-            continue                      # 只看 user 消息
+        # ── 格式 A：LangChain HumanMessage（add_messages reducer 转换后的格式） ──
+        if hasattr(msg, 'type') and msg.type == "human":
+            content = msg.content                     # Pydantic 属性访问
+            if isinstance(content, str):
+                return content.strip()
+            # content 是 list[ContentBlock] 的情况
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    # 每个 block 可能是 dict 或 Pydantic 对象
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif hasattr(block, 'type') and getattr(block, 'type') == "text":
+                        text_parts.append(getattr(block, 'text', ''))
+                return " ".join(text_parts).strip()
+            continue
 
-        content = msg.get("content", "")
-        # Anthropic 的 content 可能是纯字符串，也可能是 block 列表
-        if isinstance(content, str):
-            return content.strip()        # 简单情况：content 就是一个 str
-
-        # 复杂情况：content 是 [{"type": "text", "text": "..."}, ...]
-        # 只提取 type=="text" 的 block
-        if isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            return " ".join(text_parts).strip()
+        # ── 格式 B：Anthropic 原生 dict ──
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content.strip()
+            # content 是 [{"type": "text", "text": "..."}, ...]
+            if isinstance(content, list):
+                text_parts = []
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif hasattr(block, 'type') and getattr(block, 'type') == "text":
+                        text_parts.append(getattr(block, 'text', ''))
+                return " ".join(text_parts).strip()
 
     return ""                            # 没有 user 消息（异常情况）
 
