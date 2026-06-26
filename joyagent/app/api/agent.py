@@ -25,6 +25,9 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 # BaseModel: 请求/响应数据校验和序列化
 
+# ── Python 标准库 ──
+import copy                          # 深拷贝初始 state（astream 循环的基底）
+
 # ── 项目内导入 ──
 from app.agent.agent import Agent
 # Phase 1-2 Simple Agent: 适合单步骤任务的 ReAct Loop
@@ -224,6 +227,130 @@ def _extract_final_response(final_state: dict) -> str:
     return final_state.get("reflection_notes", "Task completed.")
 
 
+def _sanitize_event_data(node_name: str, node_output: dict) -> dict:
+    """
+    将 Node 的原始输出转为 WebSocket 可序列化的精简事件数据。
+
+    不同 Node 提取的关键信息：
+      - planner:   plan 步骤列表（每个步骤的 id/desc/tool/status）
+      - executor:  tool_calls（工具调用记录）、current_step_index
+      - reflector: task_completed、need_replan、reflection_notes
+
+    同时截断过长字符串（>500 字符），避免推送事件撑爆 WebSocket 帧。
+    """
+    data: dict = {}
+
+    if node_name == "planner":
+        # 提取计划摘要，方便前端渲染步骤列表
+        plan = node_output.get("plan", [])
+        data["plan"] = [
+            {
+                "step_id": s.get("step_id"),
+                "description": (s.get("description", "") or "")[:200],
+                "tool_name": s.get("tool_name"),
+                "status": s.get("status", "pending"),
+            }
+            for s in plan
+        ]
+        data["total_steps"] = len(plan)
+
+    elif node_name == "executor":
+        # 提取本步新增的工具调用（不包含历史累积）
+        tool_log = node_output.get("tool_call_history", [])
+        # astream updates 模式下，tool_call_history 只含本步的增量
+        data["tool_calls"] = [
+            {
+                "tool_name": t.get("tool_name", "?"),
+                "success": t.get("success", False),
+                "summary": (t.get("result", "") or "")[:200],
+            }
+            for t in (tool_log or [])[-5:]  # 最多取最近 5 条
+        ]
+        data["current_step_index"] = node_output.get("current_step_index")
+
+    elif node_name == "reflector":
+        data["task_completed"] = node_output.get("task_completed", False)
+        data["need_replan"] = node_output.get("need_replan", False)
+        notes = node_output.get("reflection_notes", "") or ""
+        data["reflection_notes"] = notes[:500]
+        data["reflection_count"] = node_output.get("reflection_count")
+
+    return data
+
+
+async def _run_workflow_streaming(
+    initial_state: dict,
+    session_id: str,
+) -> dict:
+    """
+    以 astream 模式执行 LangGraph 工作流，实时广播每个 Node 的进度。
+
+    这是 ainvoke → astream 的升级版：
+      - ainvoke: 黑盒执行，一次性返回最终 state
+      - astream: 每完成一个 Node 就 yield，此处改为 broadcast
+
+    工作流程：
+      1. 用 astream(stream_mode="updates") 启动流式执行
+      2. 每 yield 一个 {node_name: state_update} 事件：
+         a. broadcast "node_start" → 前端更新进度条
+         b. broadcast "node_done"  → 前端渲染该 Node 的输出
+         c. 累积 state_update 到 final_state
+      3. 工作流结束后 broadcast "workflow_end"
+
+    stream_mode="updates" 含义：
+      每次 yield 只包含本次 Node 的**增量更新**（partial AgentState），
+      而非完整 state。需要调用方手动累积合并。
+
+    Args:
+        initial_state: 初始 AgentState dict
+        session_id:   WebSocket session —— 事件只推给这个 session 的客户端
+
+    Returns:
+        累积后的完整 final_state（与 ainvoke 返回值相同）
+    """
+    # 从初始 state 的副本开始累积（避免修改调用方的 original）
+    final_state = copy.deepcopy(initial_state)
+
+    # astream(stream_mode="updates") 每完成一个 Node yield 一次
+    async for event in agent_workflow.astream(
+        initial_state,
+        stream_mode="updates",
+    ):
+        # event 结构：{"planner": {"plan": [...], "current_step_index": 0}}
+        for node_name, node_update in event.items():
+
+            # ── 1. 广播 node_start ──
+            await _broadcast_event(session_id, {
+                "type": "node_start",
+                "node": node_name,
+            })
+
+            # ── 2. 广播 node_done（含该 Node 的精简输出数据） ──
+            await _broadcast_event(session_id, {
+                "type": "node_done",
+                "node": node_name,
+                "data": _sanitize_event_data(node_name, node_update),
+            })
+
+            # ── 3. 累积增量到 final_state ──
+            #    astream updates 模式只给增量 dict，需要手动 merge
+            final_state.update(node_update)
+
+    # ── 工作流终止事件 ──
+    plan = final_state.get("plan", [])
+    await _broadcast_event(session_id, {
+        "type": "workflow_end",
+        "task_completed": final_state.get("task_completed", False),
+        "reflection_count": final_state.get("reflection_count", 0),
+        "total_steps": len(plan),
+        "completed_steps": sum(
+            1 for s in plan if s.get("status") == "completed"
+        ),
+    })
+
+    return final_state
+
+
 # ═══════════════════════════════════════════════════════════════════
 # REST 端点
 # ═══════════════════════════════════════════════════════════════════
@@ -251,9 +378,11 @@ async def chat(request: ChatRequest):
     session_id = request.session_id or _new_session_id()
 
     if _should_use_workflow(request.message, request.force_workflow):
-        # ── Phase 3: LangGraph Workflow ──────────────────────────
+        # ── Phase 3: LangGraph Workflow (astream + WebSocket) ──────
         initial_state = _build_initial_state(request.message)
-        final_state = await agent_workflow.ainvoke(initial_state)
+        final_state = await _run_workflow_streaming(
+            initial_state, session_id,
+        )
 
         response_text = _extract_final_response(final_state)
         plan = final_state.get("plan", [])
@@ -308,7 +437,9 @@ async def workflow(request: WorkflowRequest):
         max_reflections=request.max_reflections,
     )
 
-    final_state = await agent_workflow.ainvoke(initial_state)
+    final_state = await _run_workflow_streaming(
+        initial_state, session_id,
+    )
 
     response_text = _extract_final_response(final_state)
     plan = final_state.get("plan", [])
