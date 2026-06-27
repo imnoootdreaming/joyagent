@@ -6,17 +6,59 @@ import os                          # 路径检查和 working_dir 验证
 # ── 项目内导入 ──
 from app.tools.base import BaseTool, ToolResult  # 工具基类和统一返回格式
 
+# ── Phase 5: Docker Sandbox 集成 ──
+from app.sandbox.docker_runner import DockerRunner  # Docker 沙箱安全执行器
+from app.sandbox.security import SandboxConfig       # 六层安全防御配置
+
+
+# ── 模块级缓存的 DockerRunner 实例 ──
+# 只创建一次，后续调用复用同一个客户端连接
+_runner_cache: dict = {}                             # {"key": DockerRunner}
+
+
+def _get_sandbox_runner(working_dir: str = None) -> DockerRunner | None:
+    """
+    获取可用的 Docker Sandbox 执行器。
+
+    如果 Docker 可用 → 返回配置好的 DockerRunner（使用当前项目目录作为 mount_path）。
+    如果 Docker 不可用 → 返回 None，调用方降级到宿主机 subprocess。
+
+    缓存策略：
+      同一 mount_path 的 runner 只创建一次，避免反复 docker.from_env()。
+    """
+    wd = working_dir or os.getcwd()
+    cache_key = os.path.abspath(wd)
+
+    if cache_key not in _runner_cache:
+        config = SandboxConfig(mount_path=cache_key)
+        runner = DockerRunner(config)
+        _runner_cache[cache_key] = runner
+
+    runner = _runner_cache[cache_key]
+    if runner.is_available:
+        return runner
+    return None
+
 
 class ShellExecuteTool(BaseTool):
     """
-    Phase 2: Shell 命令执行工具。
-    使用 asyncio.create_subprocess_shell 实现异步非阻塞执行。
+    Phase 2 → Phase 5: Shell 命令执行工具。
 
-    ⚠️ 安全设计债务（Phase 5 偿还）：
-      - 当前无命令白名单/黑名单
-      - 无资源限制（CPU/内存/磁盘）
-      - 无网络访问控制
-      - 无超时强制（Phase 5 加 Docker Sandbox + 超时 kill）
+    执行策略（自动选择）：
+      Phase 5 模式（Docker 可用）→ DockerRunner 沙箱隔离执行
+        ✅ 六层安全防御（容器隔离/资源限制/网络隔离/只读文件/权限限制/超时控制）
+        ✅ 每次执行创建新容器 → 执行 → 销毁（无状态、无污染）
+        ✅ 非 root 用户执行（user="sandbox"）
+
+      Phase 2 降级模式（Docker 不可用）→ asyncio.create_subprocess_shell
+        ⚠️ 无安全隔离——仅在开发阶段使用
+        ⚠️ 命令直接在宿主机执行
+
+    为什么不在 Agent 层新增独立工具，而是修改现有工具？
+      - Sandbox 是基础设施，不是可选功能（类比：安全带默认扣上）
+      - Agent 不应该关心“是用 Docker 还是 subprocess”——它只管执行命令
+      - 唯一命令执行通道 = 无法绕过沙箱 = 安全设计更可靠
+      - Claude Code 也是所有 Bash 走同一个工具入口，沙箱是透明实现细节
     """
 
     # ─── 工具标识 ───
@@ -57,25 +99,25 @@ class ShellExecuteTool(BaseTool):
         """
         Shell 命令是最高危操作——可以删除文件、安装恶意软件、泄露数据。
         Phase 2: 只打黄色警告日志。
+        Phase 5: Docker 沙箱提供六层隔离防护（容器/资源/网络/文件/权限/超时）。
         Phase 9: 接入用户确认流程，每次执行前弹出预览。
         """
         return True
 
     # ─── 核心执行逻辑 ───
-    async def execute(self, command: str, working_dir: str = None, **kwargs) -> ToolResult:
+    async def execute(self, command: str, working_dir: str = None,
+                      **kwargs) -> ToolResult:
         """
-        异步执行 shell 命令，捕获 stdout 和 stderr。
+        执行 shell 命令（自动选择 Docker Sandbox 或宿主机 subprocess）。
 
-        参数映射机制：
-          ToolRegistry.execute(name="execute_shell", command="ls", working_dir="/tmp")
-          → self.execute(command="ls", working_dir="/tmp")
+        Args:
+            command:     要执行的 shell 命令（支持管道和重定向）
+            working_dir: 命令执行的工作目录（可选，默认当前目录）
 
-        为什么用 asyncio.create_subprocess_shell 而不是 subprocess.run？
-          - 异步非阻塞：Agent 可以在等待命令完成时处理其他任务
-          - 同时捕获 stdout + stderr：PIPE 模式两个流独立
-          - 可扩展：Phase 5 可以通过 .kill() 实现超时强制终止
+        Returns:
+            ToolResult — success=True 表示 exit_code==0 且未超时
         """
-        # 1. 校验 working_dir（如果指定了）
+        # ── 0. 校验 working_dir ──
         if working_dir and not os.path.isdir(working_dir):
             return ToolResult(
                 success=False,
@@ -83,59 +125,166 @@ class ShellExecuteTool(BaseTool):
                 error=f"DirectoryNotFound: {working_dir}",
             )
 
-        try:
-            # 2. 启动异步子进程
-            process = await asyncio.create_subprocess_shell(
-                command,                             # 要执行的命令字符串（支持管道和重定向）
-                stdout=subprocess.PIPE,              # 捕获标准输出到管道
-                stderr=subprocess.PIPE,              # 捕获标准错误到管道
-                cwd=working_dir,                     # 指定工作目录（None 表示使用当前目录）
+        # ── 1. 获取沙箱执行器 ──
+        sandbox_runner = _get_sandbox_runner(working_dir)
+
+        if sandbox_runner is not None:
+            # ── Phase 5: Docker Sandbox 执行 ──────────────
+            return await self._execute_in_sandbox(
+                command, working_dir, sandbox_runner
+            )
+        else:
+            # ── Phase 2 降级: 宿主机 subprocess ──────────
+            return await self._execute_on_host(command, working_dir)
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 5: Docker Sandbox 路径
+    # ═══════════════════════════════════════════════════════════
+
+    async def _execute_in_sandbox(
+        self,
+        command: str,
+        working_dir: str | None,
+        runner: DockerRunner,
+    ) -> ToolResult:
+        """
+        在 Docker 沙箱中执行命令。
+
+        容器内执行环境：
+          - 用户: sandbox（非 root）
+          - 工作目录: /workspace（宿主机项目目录 bind mount）
+          - 网络: none（无外部连接）
+          - 根文件系统: 只读（/workspace 除外）
+          - CPU: 1 核, 内存: 512M
+          - 超时: 60 秒
+        """
+        # 映射 working_dir: 宿主机路径 → 容器内 /workspace
+        exec_result = await runner.run_command(
+            command,
+            working_dir="/workspace",              # 容器内工作目录固定为 /workspace
+        )
+
+        # Docker 连接失败或镜像不存在 → 降级到宿主机执行
+        if exec_result.exit_code == -1 and exec_result.error_message:
+            err = exec_result.error_message
+
+            # ── Image not found → 打印构建提示后降级 ──
+            if "ImageNotFound" in err or "not found" in err.lower():
+                print(
+                    f"  \033[33m[!] Sandbox image not found. "
+                    f"Falling back to host execution.\033[0m\n"
+                    f"  \033[33m    Build it: docker build -t "
+                    f"joyagent-sandbox:latest "
+                    f"-f sandbox_config/Dockerfile .\033[0m"
+                )
+                return await self._execute_on_host(command, working_dir)
+
+            # ── Docker daemon 不可用 → 降级 ──
+            if "Docker unavailable" in err:
+                print(
+                    f"  \033[33m[!] Docker unavailable — "
+                    f"falling back to host execution.\033[0m"
+                )
+                return await self._execute_on_host(command, working_dir)
+
+            # ── 其他 Docker 错误 → 返回错误 ──
+            return ToolResult(
+                success=False,
+                message=f"Error: [Sandbox] {err[:300]}",
+                error=f"DockerError: {err}",
             )
 
-            # 3. 等待子进程结束并读取输出（带 30 秒超时）
+        # ── 成功：将 ExecutionResult 转为 ToolResult ──
+        output = exec_result.combined_output
+
+        was_truncated = len(output) > 5000
+        truncated_output = output[:5000]
+
+        return ToolResult(
+            success=exec_result.succeeded,          # exit_code==0 且未超时
+            message=truncated_output,
+            metadata={
+                "command": command,
+                "working_dir": working_dir,
+                "exit_code": exec_result.exit_code,
+                "truncated": was_truncated,
+                "original_length": len(output),
+                "execution_mode": "docker_sandbox",  # ⬅ 标记执行模式
+                "container_elapsed_s": round(exec_result.elapsed_seconds, 3),
+                "timed_out": exec_result.timed_out,
+            },
+        )
+
+    # ═══════════════════════════════════════════════════════════
+    # Phase 2 降级: 宿主机 subprocess 路径
+    # ═══════════════════════════════════════════════════════════
+
+    async def _execute_on_host(
+        self,
+        command: str,
+        working_dir: str | None,
+    ) -> ToolResult:
+        """
+        Phase 2 降级模式：直接在宿主机执行命令。
+
+        使用 asyncio.create_subprocess_shell 实现异步非阻塞执行，
+        带 30 秒超时保护和输出截断。
+
+        ⚠️ 安全性警告：
+          此模式无任何隔离保护——Agent 生成的代码直接在宿主机运行。
+          仅在以下情况使用：
+            1. Docker 未安装/不可用（开发阶段）
+            2. 沙箱镜像未构建
+            3. DockerRunner 主动降级（如 ImageNotFound）
+        """
+        try:
+            # 1. 启动异步子进程
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=working_dir,
+            )
+
+            # 2. 等待子进程结束并读取输出（带 30 秒超时）
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),           # communicate() 返回 (stdout, stderr) 字节元组
-                    timeout=30.0,                    # 30 秒后抛出 TimeoutError
+                    process.communicate(),
+                    timeout=30.0,
                 )
             except asyncio.TimeoutError:
-                # 超时 → 杀死子进程，返回错误
-                process.kill()                       # 发送 SIGKILL（Windows 上是 TerminateProcess）
-                await process.wait()                 # 等待进程彻底结束（回收僵尸进程）
+                process.kill()
+                await process.wait()
                 return ToolResult(
                     success=False,
                     message=f"Error: Command timed out after 30 seconds: '{command}'",
                     error=f"TimeoutError: {command}",
                 )
 
-            # 4. 解码输出（用 errors="replace" 避免非 UTF-8 字节导致崩溃）
+            # 3. 解码输出
             output = stdout_bytes.decode("utf-8", errors="replace")
-            # errors="replace": 遇到无法解码的字节用 U+FFFD 替换，而不是抛 UnicodeDecodeError
-
-            # 5. 如果 stderr 有内容，附加到输出末尾
             if stderr_bytes:
                 stderr_text = stderr_bytes.decode("utf-8", errors="replace")
-                output += "\n[STDERR]\n" + stderr_text  # 标记区分 stdout 和 stderr
+                output += "\n[STDERR]\n" + stderr_text
 
-            # 6. 截断过长输出——防止撑爆 LLM 上下文窗口
+            # 4. 截断过长输出
             was_truncated = len(output) > 5000
-            truncated_output = output[:5000]          # 最多返回 5000 字符
+            truncated_output = output[:5000]
 
-            # 7. 构建返回结果
             return ToolResult(
-                success=process.returncode == 0,      # returncode=0 表示命令成功退出
-                message=truncated_output,             # 给 LLM 看的输出文本
+                success=process.returncode == 0,
+                message=truncated_output,
                 metadata={
-                    "command": command,               #   - 原始命令
-                    "working_dir": working_dir,       #   - 工作目录
-                    "exit_code": process.returncode,  #   - 进程退出码（0=成功，非0=失败）
-                    "truncated": was_truncated,       #   - 输出是否被截断
-                    "original_length": len(output),   #   - 原始输出长度
+                    "command": command,
+                    "working_dir": working_dir,
+                    "exit_code": process.returncode,
+                    "truncated": was_truncated,
+                    "original_length": len(output),
+                    "execution_mode": "host_subprocess",  # ⬅ 标记降级模式
                 },
             )
 
         except Exception as e:
-            # 兜底：子进程启动失败（如命令语法错误）或其他未预期异常
             return ToolResult(
                 success=False,
                 message=f"Error: Failed to execute '{command}': {e}",
