@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Phase 6 Step 1: Token Manager — Token 计数与 Context Window 管理。
 

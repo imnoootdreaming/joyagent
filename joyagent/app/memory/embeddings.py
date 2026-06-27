@@ -1,3 +1,4 @@
+from __future__ import annotations
 """
 Phase 6 Step 2: Embedding Service — 文本向量化服务。
 
@@ -405,7 +406,7 @@ class EmbeddingService:
         if norm_a == 0.0 or norm_b == 0.0:
             return 0.0
 
-        return dot_product / (norm_a * norm_b)
+        return dot_product / (norm_a * norm_b) # 点积 * 范数乘积
 
     @staticmethod
     def euclidean_distance(a: list[float], b: list[float]) -> float:
