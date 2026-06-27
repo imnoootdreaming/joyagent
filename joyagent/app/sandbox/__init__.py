@@ -31,6 +31,8 @@ from app.sandbox.docker_runner import (
     create_default_runner,
 )
 
+from app.sandbox.pytest_runner import PytestRunner
+
 __all__ = [
     "SandboxConfig",
     "ExecutionResult",
@@ -39,4 +41,5 @@ __all__ = [
     "FixLoopState",
     "DockerRunner",
     "create_default_runner",
+    "PytestRunner",
 ]
