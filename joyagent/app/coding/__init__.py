@@ -47,9 +47,16 @@ from app.coding.diff_generator import (
     DiffHunk,
 )
 
+from app.coding.patch_apply import (
+    PatchApplier,
+    PatchResult,
+    PatchHunkResult,
+)
+
 __all__ = [
     "RepositoryLoader", "FileInfo", "RepoContext",
     "CodeSearcher", "SearchMatch", "SearchResult",
     "ASTAnalyzer", "ASTAnalysis", "FunctionInfo", "ClassInfo", "VariableInfo",
     "DiffGenerator", "DiffResult", "DiffHunk",
+    "PatchApplier", "PatchResult", "PatchHunkResult",
 ]
