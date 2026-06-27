@@ -192,12 +192,18 @@ class FixLoop:
         docker_runner: DockerRunner,
         max_attempts: int = 3,
         max_stall_retries: int = 2,
+        bad_case_analyzer=None,         # Optional[BadCaseAnalyzer] — Phase 5 Step 5.5
+        auto_collect_bad_cases: bool = True,
     ):
         """
         Args:
             docker_runner:    已配置好的 DockerRunner 实例
             max_attempts:     最多修复尝试次数（默认 3）
             max_stall_retries:停滞检测阈值——连续 N 次相同错误指纹后终止
+            bad_case_analyzer: BadCaseAnalyzer 实例（Phase 5.5）。
+                              传入 None → 不收集 Bad Case。
+            auto_collect_bad_cases: 是否在 Fix Loop 失败后自动收集 Bad Case。
+                                    True（默认）→ 自动收集并打印报告摘要。
         """
         self.test_runner = PytestRunner(docker_runner)
         self.error_parser = ErrorParser()
@@ -209,6 +215,10 @@ class FixLoop:
 
         self.max_attempts = max_attempts
         self.max_stall_retries = max_stall_retries
+
+        # Bad Case 收集器（Phase 5 Step 5.5）
+        self.bad_case_analyzer = bad_case_analyzer
+        self.auto_collect = auto_collect_bad_cases
 
     # ── 主循环 ──────────────────────────────────────────────
 
@@ -434,6 +444,43 @@ class FixLoop:
             print(f"\n  ⚠ Fix Loop EXHAUSTED — {state.current_attempt}/{self.max_attempts} attempts used")
         else:
             print(f"\n  ❌ Fix Loop terminated — see fix_history for details")
+
+        # ── Phase 5.5: Auto-collect Bad Case ─────────────────
+        if (
+            self.auto_collect
+            and self.bad_case_analyzer
+            and state.should_escalate()
+        ):
+            # Build stderr from last failure
+            last_stderr = ""
+            if state.fix_history:
+                last_entry = state.fix_history[-1]
+                failures_list = last_entry.get("failures", [])
+                last_stderr = "\n".join(
+                    f"{f.get('error_type', '?')}: {f.get('error_message', '')}"
+                    for f in failures_list
+                )
+
+            source_code = self._format_source_files(source_files)
+
+            self.bad_case_analyzer.collect_from_fix_loop(
+                fix_state=state,
+                task=task_context,
+                category="",
+                source_files=source_files,
+            )
+
+            total = len(self.bad_case_analyzer.cases)
+            print(f"  \033[35m📊 Bad Case #{total} collected — "
+                  f"call bad_case_analyzer.generate_report() "
+                  f"for analysis\033[0m")
+
+            # Auto-print patterns if enough data
+            if total >= 3:
+                patterns = self.bad_case_analyzer.detect_patterns()
+                if patterns:
+                    print(f"  \033[35m   Top pattern: {patterns[0].pattern_name} "
+                          f"({patterns[0].frequency}x)\033[0m")
 
         return state
 

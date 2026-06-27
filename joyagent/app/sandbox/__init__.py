@@ -34,6 +34,13 @@ from app.sandbox.docker_runner import (
 from app.sandbox.pytest_runner import PytestRunner
 from app.sandbox.error_parser import ErrorParser
 from app.sandbox.fix_loop import FixLoop
+from app.sandbox.bad_case_analyzer import (
+    BadCaseAnalyzer,
+    BadCase,
+    FailurePattern,
+    PromptImprovement,
+    bad_case_analyzer,
+)
 
 __all__ = [
     "SandboxConfig",
@@ -46,4 +53,9 @@ __all__ = [
     "PytestRunner",
     "ErrorParser",
     "FixLoop",
+    "BadCaseAnalyzer",
+    "BadCase",
+    "FailurePattern",
+    "PromptImprovement",
+    "bad_case_analyzer",
 ]
