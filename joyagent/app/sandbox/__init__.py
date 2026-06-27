@@ -33,6 +33,7 @@ from app.sandbox.docker_runner import (
 
 from app.sandbox.pytest_runner import PytestRunner
 from app.sandbox.error_parser import ErrorParser
+from app.sandbox.fix_loop import FixLoop
 
 __all__ = [
     "SandboxConfig",
@@ -44,4 +45,5 @@ __all__ = [
     "create_default_runner",
     "PytestRunner",
     "ErrorParser",
+    "FixLoop",
 ]
