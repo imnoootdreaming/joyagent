@@ -41,8 +41,15 @@ from app.coding.ast_analyzer import (
     VariableInfo,
 )
 
+from app.coding.diff_generator import (
+    DiffGenerator,
+    DiffResult,
+    DiffHunk,
+)
+
 __all__ = [
     "RepositoryLoader", "FileInfo", "RepoContext",
     "CodeSearcher", "SearchMatch", "SearchResult",
     "ASTAnalyzer", "ASTAnalysis", "FunctionInfo", "ClassInfo", "VariableInfo",
+    "DiffGenerator", "DiffResult", "DiffHunk",
 ]
