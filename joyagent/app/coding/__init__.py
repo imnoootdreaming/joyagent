@@ -33,7 +33,16 @@ from app.coding.code_search import (
     SearchResult,
 )
 
+from app.coding.ast_analyzer import (
+    ASTAnalyzer,
+    ASTAnalysis,
+    FunctionInfo,
+    ClassInfo,
+    VariableInfo,
+)
+
 __all__ = [
     "RepositoryLoader", "FileInfo", "RepoContext",
     "CodeSearcher", "SearchMatch", "SearchResult",
+    "ASTAnalyzer", "ASTAnalysis", "FunctionInfo", "ClassInfo", "VariableInfo",
 ]
