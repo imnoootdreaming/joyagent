@@ -159,6 +159,9 @@ class Agent:
                     "tool": tool_name,
                     "input": tool_input,
                     "result": content_for_llm[:500],
+                    "execution_mode": result.metadata.get("execution_mode", "unknown")
+                    if isinstance(result, ToolResult) and result.metadata
+                    else "unknown",
                 })
 
                 # ── 5d. 构造 Anthropic 格式的 tool_result ──
