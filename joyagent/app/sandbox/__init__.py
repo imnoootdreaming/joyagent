@@ -26,10 +26,17 @@ from app.sandbox.security import (
     FixLoopState,
 )
 
+from app.sandbox.docker_runner import (
+    DockerRunner,
+    create_default_runner,
+)
+
 __all__ = [
     "SandboxConfig",
     "ExecutionResult",
     "TestResult",
     "TestFailure",
     "FixLoopState",
+    "DockerRunner",
+    "create_default_runner",
 ]
