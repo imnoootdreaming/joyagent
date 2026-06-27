@@ -27,4 +27,13 @@ from app.coding.repository_loader import (
     RepoContext,
 )
 
-__all__ = ["RepositoryLoader", "FileInfo", "RepoContext"]
+from app.coding.code_search import (
+    CodeSearcher,
+    SearchMatch,
+    SearchResult,
+)
+
+__all__ = [
+    "RepositoryLoader", "FileInfo", "RepoContext",
+    "CodeSearcher", "SearchMatch", "SearchResult",
+]
