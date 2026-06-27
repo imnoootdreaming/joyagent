@@ -20,6 +20,13 @@ from app.tools.git.log import GitLogTool             # Git 日志查看（只读
 from app.tools.git.branch import GitBranchTool       # Git 分支列表（只读）
 from app.tools.git.commit import GitCommitTool       # Git 提交（危险）
 
+# ── Coding 工具（Phase 4 Step 6） ──
+from app.tools.coding.load_repo import LoadRepoTool         # 仓库结构加载（只读）
+from app.tools.coding.search_code import SearchCodeTool     # 代码搜索（只读）
+from app.tools.coding.analyze_code import AnalyzeCodeTool   # AST 分析（只读）
+from app.tools.coding.generate_diff import GenerateDiffTool # Diff 生成（只读）
+from app.tools.coding.apply_patch import ApplyPatchTool     # Patch 应用（危险）
+
 # ── Hook 统计收集器（Phase 2 Step 8） ──
 from app.tools.hooks import ToolStatsCollector  # 工具调用统计收集器
 
@@ -61,6 +68,15 @@ def register_all_tools():
 
     # Git 写入工具
     tool_registry.register_tool(GitCommitTool())      # 提交变更，危险
+
+    # Coding 工具 — 只读（搜索/分析/加载/diff）
+    tool_registry.register_tool(LoadRepoTool())       # 仓库结构概览
+    tool_registry.register_tool(SearchCodeTool())     # 代码搜索
+    tool_registry.register_tool(AnalyzeCodeTool())    # AST 结构分析
+    tool_registry.register_tool(GenerateDiffTool())   # Diff 生成
+
+    # Coding 工具 — 写入（patch 应用）
+    tool_registry.register_tool(ApplyPatchTool())     # 应用 diff（危险）
 
     # ── 注册统计收集器 Hook ──
     tool_registry.register_hook(tool_stats)
