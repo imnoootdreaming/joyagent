@@ -132,6 +132,22 @@ def _sanitize_metadata(metadata: dict | None, fallback_id: str) -> dict:
     return {"entry_id": fallback_id}
 
 
+def _is_empty_embedding(emb) -> bool:
+    """
+    判断 embedding 是否为空（兼容 numpy array、Python list、None）。
+
+    sentence-transformers 返回的是 numpy.ndarray，`if not emb` 会触发
+    "The truth value of an array is ambiguous" 错误。
+    所以用 len() 来判断。
+    """
+    if emb is None:
+        return True
+    try:
+        return len(emb) == 0
+    except TypeError:
+        return True
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # LongTermMemory — ChromaDB 持久化记忆
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -255,9 +271,9 @@ class LongTermMemory:
                 f"Must be one of: {list(self.COLLECTIONS.keys())}"
             )
 
-        # ── 自动计算 embedding（如果未提供） ──
+        # ── 自动计算 embedding（如果未提供；兼容 numpy array） ──
         embedding = entry.embedding
-        if not embedding:
+        if _is_empty_embedding(embedding):
             embedding = self._embedding_service.embed(entry.content)
             entry.embedding = embedding
 
@@ -311,7 +327,7 @@ class LongTermMemory:
                 metadatas.append(_sanitize_metadata(entry.metadata, entry.id))
 
                 emb = entry.embedding
-                if not emb:
+                if _is_empty_embedding(emb):
                     emb = self._embedding_service.embed(entry.content)
                     entry.embedding = emb
                 embeddings.append(emb)
