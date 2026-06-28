@@ -8,6 +8,7 @@ LangGraph 自动合并到全局 state。
 消息格式：纯 dict（Anthropic 原生 {"role": ..., "content": ...}），
 不依赖 langchain_core.messages，保持 Phase 1-2 的简洁格式。
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 from typing import (

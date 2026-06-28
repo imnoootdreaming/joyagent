@@ -4,6 +4,7 @@ Phase 2: ToolRegistry — 工具注册中心。
 单例模式，全局唯一。管理工具的注册、发现、执行和 Hook 生命周期。
 Agent 通过 registry 获取工具 Schema（传给 Anthropic API）并执行工具调用。
 """
+from __future__ import annotations
 
 import time                          # 工具执行耗时计算
 from app.tools.base import BaseTool, ToolResult  # 工具基类和统一返回格式

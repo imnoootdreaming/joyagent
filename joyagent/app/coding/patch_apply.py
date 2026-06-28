@@ -23,6 +23,7 @@ unified diff 精准应用到实际文件系统，支持系统 patch 命令和 Py
   4. 应用失败时自动恢复备份
   5. 结果精确报告（每个 hunk 成功/失败）
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 import os                              # 文件系统操作（路径、备份、删除）

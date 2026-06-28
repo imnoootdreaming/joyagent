@@ -21,6 +21,7 @@ Phase 5 Step 1-2: Sandbox 安全配置 + 执行/测试结果数据模型。
     6. 超时控制       — 每次执行 60s 超时 + 容器用完即销毁
     7. Human-in-the-Loop — 危险命令需要用户审批（Phase 9）
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 import os                              # 文件路径检查和 seccomp profile 读取

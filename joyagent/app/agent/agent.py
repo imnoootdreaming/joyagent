@@ -1,8 +1,10 @@
+from __future__ import annotations
 from app.agent.prompt import SYSTEM_PROMPT
 from app.service.llm_service import get_or_create_client
 from app.tools.registry import tool_registry
 from app.core.config import Config
 from app.tools.base import ToolResult
+from typing import Optional
 
 # ── Agent 核心循环常量 ──
 DEFAULT_MAX_TOKENS = 4096
@@ -31,6 +33,7 @@ class Agent:
     Autonomous coding agent — Anthropic style ReAct Loop.
 
     Phase 2: 使用 ToolRegistry 统一管理工具（替代 Phase 1 硬编码 TOOLS/TOOL_HANDLERS）。
+    Phase 6: 集成 MemoryManager — Short-term Memory 滑动窗口 + 自动压缩。
     """
 
     def __init__(self, model_name: str = None):
@@ -38,7 +41,12 @@ class Agent:
         self.client = get_or_create_client(self.model_name)
         self.max_iterations = Config.MAX_ITERATIONS
 
-    async def agent_loop(self, user_message: str, context: list = None) -> dict:
+    async def agent_loop(
+        self,
+        user_message: str,
+        context: list = None,
+        memory_manager: Optional[object] = None,  # MemoryManager | None
+    ) -> dict:
         """
         Core ReAct Loop（Anthropic native style）：
 
@@ -51,12 +59,29 @@ class Agent:
           - tools:        tool_registry.get_tool_schemas() 替代硬编码 TOOLS
           - 工具执行:      tool_registry.execute(name, **input) 替代 TOOL_HANDLERS
           - is_dangerous:  危险工具执行时打印黄色警告日志
+
+        Phase 6 变化：
+          - memory_manager: 可选的 MemoryManager 实例
+          - 使用 STM 管理消息（滑动窗口 + 自动压缩）
+          - 工具调用后自动记存到 LTM
         """
-        # 构建消息历史（纯 dict，非 LangChain 对象）
-        messages = []
+        mm = memory_manager  # 短别名
+
+        # ── 构建消息历史（纯 dict，非 LangChain 对象） ──
+        # Phase 6: 如果有 MemoryManager → 用 STM 管理
+        # 否则 → 手动管理 messages 列表（向后兼容）
+        messages: list = []
         if context:
             messages.extend(context)
         messages.append({"role": "user", "content": user_message})
+
+        # Phase 6: 如果有 MemoryManager，初始化 STM
+        if mm is not None:
+            # 将初始消息加载到 STM
+            for msg in messages:
+                mm.stm.add_message(msg)
+            # 后续使用 STM 的 get_context() 构建 LLM 上下文
+            messages = mm.get_context()
 
         iterations = 0
         tool_calls_made = []
@@ -65,6 +90,11 @@ class Agent:
 
         while iterations < self.max_iterations:
             iterations += 1
+
+            # ── Phase 6: LLM 调用前检查压缩 ──
+            if mm is not None:
+                await mm.before_llm_call()
+                messages = mm.get_context()
 
             # ── 1. 调用 LLM ──
             try:
@@ -84,6 +114,8 @@ class Agent:
 
             # ── 2. 追加 assistant 回复到消息历史 ──
             messages.append({"role": "assistant", "content": response.content})
+            if mm is not None:
+                mm.after_llm_response({"role": "assistant", "content": response.content})
 
             # ── 3. max_tokens 恢复 ──
             if response.stop_reason == "max_tokens":
@@ -118,6 +150,14 @@ class Agent:
                 for block in response.content:
                     if block.type == "text":
                         text_output += block.text
+
+                # Phase 6: 会话结束 → 通知 MemoryManager
+                if mm is not None:
+                    try:
+                        await mm.end_session()
+                    except Exception:
+                        pass
+
                 return {
                     "response": text_output or "Task completed.",
                     "stop_reason": response.stop_reason,
@@ -150,9 +190,11 @@ class Agent:
                         result.message if result.success
                         else f"Error: {result.error or result.message}"
                     )
+                    tool_success = result.success
                 else:
                     # 未知工具降级（ToolRegistry 返回带 error 的 ToolResult，一般不会到这）
                     content_for_llm = str(result)
+                    tool_success = True
 
                 # ── 5c. 记录工具调用（供 API 返回和日志审计） ──
                 tool_calls_made.append({
@@ -171,10 +213,29 @@ class Agent:
                     "content": content_for_llm,
                 })
 
+                # ── Phase 6: 工具调用后 → 记存到 LTM ──
+                if mm is not None:
+                    try:
+                        await mm.after_tool_call(
+                            tool_name=tool_name,
+                            tool_input=tool_input,
+                            tool_result=content_for_llm,
+                            success=tool_success,
+                        )
+                    except Exception:
+                        pass  # 静默降级
+
             # ── 6. 工具结果作为 user 消息追加，循环继续 ──
             messages.append({"role": "user", "content": tool_results})
 
         # 超出最大迭代次数
+        # Phase 6: 会话结束 → 通知 MemoryManager
+        if mm is not None:
+            try:
+                await mm.end_session()
+            except Exception:
+                pass
+
         return {
             "response": "Task exceeded maximum iterations.",
             "tool_calls": tool_calls_made,
