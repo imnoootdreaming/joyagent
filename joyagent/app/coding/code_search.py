@@ -18,6 +18,7 @@ CodeSearcher 是 Coding Agent 的"搜索引擎"——在 RepoContext 加载的�
 
 结果格式：每条结果包含 file + line_number + line_content + match + context_before + context_after
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 import re                              # 正则表达式匹配（核心搜索引擎）

@@ -35,6 +35,9 @@ from app.agent.agent import Agent
 from app.agent.graph.workflow import agent_workflow
 # Phase 3 LangGraph Workflow: Plan→Execute→Reflect 三阶段工作流
 
+from app.memory.manager import MemoryManager
+# Phase 6: 三级记忆系统统一入口（会话生命周期、上下文检索、自动记存）
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Router
@@ -377,15 +380,28 @@ async def chat(request: ChatRequest):
     """
     session_id = request.session_id or _new_session_id()
 
+    # ── Phase 6: 创建会话级 MemoryManager ──
+    mm = MemoryManager(session_id=session_id)
+
     if _should_use_workflow(request.message, request.force_workflow):
         # ── Phase 3: LangGraph Workflow (astream + WebSocket) ──────
+        # Phase 6: 检索历史上下文
+        history_context = await mm.begin_session(request.message)
+
         initial_state = _build_initial_state(request.message)
+        # 注入历史上下文到 messages
+        if history_context:
+            initial_state["messages"] = history_context + initial_state["messages"]
+
         final_state = await _run_workflow_streaming(
             initial_state, session_id,
         )
 
         response_text = _extract_final_response(final_state)
         plan = final_state.get("plan", [])
+
+        # Phase 6: 会话结束
+        await mm.end_session()
 
         return ChatResponse(
             response=response_text,
@@ -403,7 +419,13 @@ async def chat(request: ChatRequest):
         )
     else:
         # ── Phase 1-2: Simple Agent ──────────────────────────────
-        result = await simple_agent.agent_loop(request.message)
+        # Phase 6: 检索历史上下文 + 注入 MemoryManager
+        context = await mm.begin_session(request.message)
+        result = await simple_agent.agent_loop(
+            request.message,
+            context=context,
+            memory_manager=mm,
+        )
 
         return ChatResponse(
             response=result.get("response", ""),
@@ -432,10 +454,18 @@ async def workflow(request: WorkflowRequest):
       }'
     """
     session_id = request.session_id or _new_session_id()
+
+    # ── Phase 6: 创建会话级 MemoryManager ──
+    mm = MemoryManager(session_id=session_id)
+    history_context = await mm.begin_session(request.message)
+
     initial_state = _build_initial_state(
         request.message,
         max_reflections=request.max_reflections,
     )
+    # 注入历史上下文
+    if history_context:
+        initial_state["messages"] = history_context + initial_state["messages"]
 
     final_state = await _run_workflow_streaming(
         initial_state, session_id,
@@ -443,6 +473,9 @@ async def workflow(request: WorkflowRequest):
 
     response_text = _extract_final_response(final_state)
     plan = final_state.get("plan", [])
+
+    # Phase 6: 会话结束
+    await mm.end_session()
 
     return ChatResponse(
         response=response_text,

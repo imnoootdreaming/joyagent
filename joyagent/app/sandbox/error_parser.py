@@ -25,6 +25,7 @@ ErrorParser 是 Fix Loop 的"诊断引擎"——它将 pytest 输出的原始 tr
       category = parser.categorize_error(f)
       fix_prompt = parser.generate_fix_prompt(f, category, source_code)
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 import re                              # 正则解析 traceback 行

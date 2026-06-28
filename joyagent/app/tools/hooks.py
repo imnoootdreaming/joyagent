@@ -10,6 +10,7 @@ ToolStatsCollector: 内置统计收集器，实现 Agent 行为可观测性。
   - 维度: 调用次数 / 成功率 / P50/P95/P99 耗时
   - 输出: 周期性控制台日志 + get_stats() API 查询
 """
+from __future__ import annotations
 
 import time                          # 计算工具执行耗时（elapsed_ms）
 from abc import ABC, abstractmethod  # Hook 抽象基类

@@ -37,6 +37,7 @@ BadCaseAnalyzer 是 Agent 从"能跑"到"跑得好"的关键基础设施。
   # 查询统计数据（通过 /api/tools/stats 暴露给前端）
   stats = bad_case_analyzer.get_summary()
 """
+from __future__ import annotations
 
 # ── Python 标准库 ──
 import datetime                       # 时间戳

@@ -280,8 +280,8 @@ class ReflectionMemory:
             search_text = error.build_search_text()
             error.embedding = self._embedding_service.embed(search_text)
 
-        # ── 构建记忆内容 ──
-        status_icon = "✅" if error.fix_success else "⚠️"
+        # ── 构建记忆内容（ASCII-safe，避免 Windows GBK 编码问题） ──
+        status_icon = "[OK]" if error.fix_success else "[FAILED]"
         content = (
             f"{status_icon} **{error.error_type}** in `{error.file_path}`\n\n"
             f"Error: {error.error_message}\n\n"
@@ -338,7 +338,7 @@ class ReflectionMemory:
                     error.build_search_text()
                 )
 
-            status_icon = "✅" if error.fix_success else "⚠️"
+            status_icon = "[OK]" if error.fix_success else "[FAILED]"
             entries.append(MemoryEntry(
                 id=f"error_{error.id}",
                 content=(
@@ -750,12 +750,12 @@ def _fallback_suggestion(
     if successful:
         lines.append(f"## {len(successful)} successful fixes found for similar errors:")
         for e in successful[:3]:
-            lines.append(f"- ✅ [{e.error_type}] {e.fix_description[:200]}")
+            lines.append(f"- [OK] [{e.error_type}] {e.fix_description[:200]}")
 
     if failed:
         lines.append(f"\n## {len(failed)} failed attempts (avoid these):")
         for e in failed[:2]:
-            lines.append(f"- ⚠️ [{e.error_type}] {e.fix_description[:200]}")
+            lines.append(f"- [FAILED] [{e.error_type}] {e.fix_description[:200]}")
 
     if not successful and not failed:
         lines.append("No actionable history found.")
