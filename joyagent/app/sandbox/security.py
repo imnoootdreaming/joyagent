@@ -160,14 +160,22 @@ class SandboxConfig:
         # ── 安全配置 ──
         params["read_only"] = self.read_only_root    # 根文件只读
         params["network_mode"] = self.network_mode    # 网络隔离
-        params["no_new_privileges"] = self.no_new_privileges  # 禁止提权
+
+        # no_new_privileges 用 security_opt 实现（兼容所有 docker-py 版本）。
+        # 老版本 docker-py（<7.0）不支持 no_new_privileges 参数，
+        # 但 security_opt=["no-new-privileges:true"] 是 Docker 原生写法，全版本兼容。
+        if self.no_new_privileges:
+            params["security_opt"] = ["no-new-privileges:true"]
 
         # Docker SDK 的 cap_drop 参数
         if self.drop_capabilities:
             params["cap_drop"] = self.drop_capabilities
 
         # ── 容器生命周期 ──
-        params["auto_remove"] = True                 # 容器退出后自动删除
+        # 不用 auto_remove——容器退出后 Docker 会立即删除它，
+        # 导致 container.logs() 调用时容器已不存在。
+        # 改为在 DockerRunner.run_command() 的 finally 块中手动删除。
+        params["auto_remove"] = False                 # 手动清理，确保日志可收集
         params["detach"] = True                      # 后台运行（需要 wait 等待结果）
 
         return params
