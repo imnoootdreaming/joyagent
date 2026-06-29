@@ -13,7 +13,7 @@
 - 参考 Claude Code 架构独立实现自主编程 Agent，核⼼为 ReAct + Tool Calling 的 Agent Runtime，⽀持需求分析、任务规划、代码生成、自动测试与错误修复全流程⾃动化。
 - 基于 LangGraph StateGraph 构建 Agent Workflow，设计 Planner、Coder、Reviewer、Tester 多节点协作图，实现复杂任务拆解与状态流转，⽀持条件路由（Conditional Edge）实现⾮线性任务执⾏。
 - 基于 Anthropic Messages API 原生 Tool Use 实现 Agent Runtime，支持文件系统、Shell、Git、Web Search 等 10+ 工具动态编排，采用 stop_reason + block.type 模式判断工具调用。
-- 设计 Short-term Memory（滑动窗口 + 摘要压缩）、Long-term Memory（ChromaDB 向量检索）与 Reflection Memory（错误嵌入 + 相似经验召回），实现会话摘要、上下文压缩及任务状态持久化。
+- 设计 Short-term Memory（滑动窗口 + 摘要压缩）、Long-term Memory（ChromaDB 向量检索）与 Reflection Memory（错误嵌入 + 相似经验召回），实现会话摘要、上下文压缩及任务状态持久化。基于线程安全 LRU + SHA256 哈希键实现嵌入缓存层，在 Fix Loop 重复分析场景下减少 70%+ 重复计算。
 - 设计 Tool Call Hook 中间件机制，基于 on_pre_execute / on_post_execute / on_error 生命周期拦截实现工具调用全链路追踪，支持调用频率、成功率、P50/P99 耗时等多维度实时统计，构建 Agent 行为可观测性体系。
 - 基于 MCP 协议实现插件体系，集成官方 GitHub MCP Server、PostgreSQL MCP Server，并自建 1 个 Demo MCP Server 展示协议理解。
 - 基于 Docker Sandbox 构建安全代码执⾏环境，实现 CPU/内存/网络全限制 + 只读文件挂载，防容器逃逸。

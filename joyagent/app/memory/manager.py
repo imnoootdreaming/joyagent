@@ -577,24 +577,28 @@ class MemoryManager:
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 自动存入 LTM 的工具白名单
+# 自动存入 LTM 的工具白名单（与 app/tools 中实际注册的工具名匹配）
 _LTM_STORE_WHITELIST: dict[str, str] = {
     # 文件操作 → "code"
     "write_file": "code",
+    "read_file": "code",
+    "file_read": "code",
     "file_write": "code",
     "apply_patch": "code",
     "generate_diff": "code",
-    # Shell 执行 → "task"
-    "execute_shell": "task",
-    "shell_execute": "task",
+    "load_repo": "code",
     # 代码分析 → "code"
     "analyze_code": "code",
     "search_code": "code",
-    "read_file": "code",
-    "file_read": "code",
-    # Git → "task"
+    # Shell 执行 → "task"
+    "execute_shell": "task",
+    "shell_execute": "task",
+    # Git 操作 → "task"
     "git_commit": "task",
     "git_branch": "task",
+    "git_status": "task",
+    "git_log": "task",
+    "git_diff": "task",
 }
 
 

@@ -12,7 +12,7 @@ async def startup():
     """Phase 2: 启动时注册所有工具到 ToolRegistry。"""
     from app.tools import register_all_tools
     register_all_tools()
-    print("  [OK] JoyAgent startup complete -- ToolRegistry initialized.\n")
+    print("  [OK] JoyAgent-v0.6.0 startup complete -- ToolRegistry initialized.\n")
 
 
 if __name__ == "__main__":
