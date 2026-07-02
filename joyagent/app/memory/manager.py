@@ -348,16 +348,9 @@ class MemoryManager:
         """
         self._tool_call_count += 1
 
-        # ── 1. 追加到 STM ──
-        tool_result_msg = {
-            "role": "user",
-            "content": [{
-                "type": "tool_result",
-                "tool_use_id": f"{tool_name}_{self._tool_call_count}",
-                "content": tool_result,
-            }],
-        }
-        self.stm.add_message(tool_result_msg)
+        # 注意：tool_result 消息不在这里追加到 STM——Agent 循环在 messages.append()
+        # 处使用真正的 tool_use_id（来自 API 响应）构造 tool_result。
+        # 这里只负责判断是否存入 LTM，不碰 STM。
 
         # ── 2. 判断是否存入 LTM ──
         if not self.auto_store_tool_results:

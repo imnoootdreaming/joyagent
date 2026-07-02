@@ -304,7 +304,7 @@ class SafetyCheckHook(ToolHook):
             return None
 
         for pattern, reason in DENY_PATTERNS:
-            if not pattern:
+            if not pattern or not reason:  # 空 reason = 占位模式（如 /dev/null），跳过
                 continue
             try:
                 if re.search(pattern, command, re.IGNORECASE):

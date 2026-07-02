@@ -24,6 +24,18 @@ RUN uv pip install --system \
     "tiktoken>=0.13.0" \
     "uvicorn>=0.49.0"
 
+# 模型文件打入镜像，离线可用
+COPY models/ /models/
+
+# 告诉 sentence-transformers 用本地路径，不走 HuggingFace 网络
+ENV EMBEDDING_MODEL=/models/all-MiniLM-L6-v2
+ENV HF_HUB_OFFLINE=1
+
+# Sandbox 宿主机挂载路径：JoyAgent 容器内 /app = 宿主机 /mnt/hgfs/joyagent
+# DockerRunner 通过 docker.sock 在宿主机创建 sandbox 容器时，
+# 需要用宿主机的真实路径做 bind mount
+ENV SANDBOX_HOST_MOUNT_PATH=/mnt/hgfs/joyagent
+
 COPY . .
 
 EXPOSE 8000

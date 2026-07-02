@@ -13,4 +13,4 @@ class Config:
     ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL")
     DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "DeepSeek-v4-pro[1m]")
     FALLBACK_MODEL = os.getenv("FALLBACK_MODEL")
-    MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "15"))
+    MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "30"))

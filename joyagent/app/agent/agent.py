@@ -226,7 +226,10 @@ class Agent:
                         pass  # 静默降级
 
             # ── 6. 工具结果作为 user 消息追加，循环继续 ──
-            messages.append({"role": "user", "content": tool_results})
+            tool_result_msg = {"role": "user", "content": tool_results}
+            messages.append(tool_result_msg)
+            if mm is not None:
+                mm.stm.add_message(tool_result_msg)  # 同步到 STM（使用真正的 tool_use_id）
 
         # 超出最大迭代次数
         # Phase 6: 会话结束 → 通知 MemoryManager

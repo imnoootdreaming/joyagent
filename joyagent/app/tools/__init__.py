@@ -20,6 +20,9 @@ from app.tools.git.log import GitLogTool             # Git 日志查看（只读
 from app.tools.git.branch import GitBranchTool       # Git 分支列表（只读）
 from app.tools.git.commit import GitCommitTool       # Git 提交（危险）
 
+# ── Memory 工具（Phase 6） ──
+from app.tools.remember import RememberTool         # 长期记忆保存/检索
+
 # ── Coding 工具（Phase 4 Step 6） ──
 from app.tools.coding.load_repo import LoadRepoTool         # 仓库结构加载（只读）
 from app.tools.coding.search_code import SearchCodeTool     # 代码搜索（只读）
@@ -81,6 +84,9 @@ def register_all_tools():
 
     # Coding 工具 — 写入（patch 应用）
     tool_registry.register_tool(ApplyPatchTool())     # 应用 diff（危险）
+
+    # Memory 工具（Phase 6 — 长期记忆）
+    tool_registry.register_tool(RememberTool())        # 保存/检索长期记忆
 
     # ── 注册安全检查器 Hook（在统计收集器之前） ──
     tool_registry.register_hook(tool_safety)

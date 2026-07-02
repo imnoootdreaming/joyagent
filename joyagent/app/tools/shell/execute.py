@@ -20,17 +20,30 @@ def _get_sandbox_runner(working_dir: str = None) -> DockerRunner | None:
     """
     获取可用的 Docker Sandbox 执行器。
 
-    如果 Docker 可用 → 返回配置好的 DockerRunner（使用当前项目目录作为 mount_path）。
+    如果 Docker 可用 → 返回配置好的 DockerRunner。
     如果 Docker 不可用 → 返回 None，调用方降级到宿主机 subprocess。
 
     缓存策略：
       同一 mount_path 的 runner 只创建一次，避免反复 docker.from_env()。
+
+    mount_path 解析：
+      - Docker 容器内运行时，容器内路径（如 /app）≠ 宿主机路径。
+      - 通过环境变量 SANDBOX_HOST_MOUNT_PATH 指定宿主机上的真实项目路径。
+      - 未设置时，默认使用当前工作目录（适用于直接在宿主机运行）。
     """
     wd = working_dir or os.getcwd()
-    cache_key = os.path.abspath(wd)
+
+    # Docker 容器内运行时，宿主机路径通过环境变量指定
+    host_mount = os.environ.get("SANDBOX_HOST_MOUNT_PATH", "")
+    if host_mount:
+        mount_path = host_mount
+    else:
+        mount_path = os.path.abspath(wd)
+
+    cache_key = mount_path
 
     if cache_key not in _runner_cache:
-        config = SandboxConfig(mount_path=cache_key)
+        config = SandboxConfig(mount_path=mount_path)
         runner = DockerRunner(config)
         _runner_cache[cache_key] = runner
 
