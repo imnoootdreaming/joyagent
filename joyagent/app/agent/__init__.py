@@ -17,6 +17,9 @@ from app.agent.reviewer import ReviewerAgent
 # ── Step 4: Router Agent ──
 from app.agent.router import RouterAgent
 
+# ── Step 5: MultiAgentOrchestrator ──
+from app.agent.orchestrator import MultiAgentOrchestrator, OrchestratorConfig
+
 __all__ = [
     # Base
     "BaseAgent",
@@ -36,4 +39,7 @@ __all__ = [
     "ReviewerAgent",
     # Step 4: Router Agent
     "RouterAgent",
+    # Step 5: MultiAgentOrchestrator
+    "MultiAgentOrchestrator",
+    "OrchestratorConfig",
 ]

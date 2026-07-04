@@ -87,6 +87,7 @@ class InboxWatcher:
         Returns:
             创建的 asyncio.Task，可用于取消或等待。
         """
+        self._running = True  # 在创建 task 前设置，避免竞态
         self._task = asyncio.create_task(self.run())
         return self._task
 
