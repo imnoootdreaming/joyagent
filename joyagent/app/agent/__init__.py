@@ -14,6 +14,9 @@ from app.agent.coder import CoderAgent
 from app.agent.tester import TesterAgent
 from app.agent.reviewer import ReviewerAgent
 
+# ── Step 4: Router Agent ──
+from app.agent.router import RouterAgent
+
 __all__ = [
     # Base
     "BaseAgent",
@@ -31,4 +34,6 @@ __all__ = [
     "CoderAgent",
     "TesterAgent",
     "ReviewerAgent",
+    # Step 4: Router Agent
+    "RouterAgent",
 ]
