@@ -6,9 +6,15 @@ Phase 3 Step 6: FastAPI 接入 — 智能路由 Simple Agent / LangGraph Workflo
   2. POST /api/workflow  — 新增，强制使用 LangGraph Plan→Execute→Reflect 工作流
   3. WS /ws/workflow/{id} — 新增，实时推送工作流各 Node 执行进度
 
+Phase 7: Multi-Agent 接入
+  4. POST /api/multi-agent       — 新增，Multi-Agent + Mailbox 协作入口
+  5. GET  /api/multi-agent/status — 新增，Multi-Agent 系统状态监控
+  6. GET  /api/multi-agent/audit  — 新增，消息审计日志查询
+
 路由策略：
   - 简单任务（"读取 xxx 文件"） → Phase 1-2 Simple Agent（更快）
   - 复杂任务（"构建一个 xxx 项目"） → Phase 3 LangGraph Workflow（更可靠）
+  - 大规模任务（多文件、多步骤、含测试） → Phase 7 Multi-Agent（完整协作）
   - 用户可通过 force_workflow=true 强制使用 LangGraph
 """
 
@@ -576,3 +582,158 @@ async def websocket_workflow(websocket: WebSocket, session_id: str):
                     f"  [ws] client disconnected from session {session_id} "
                     f"(remaining: {remaining})"
                 )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase 7: Multi-Agent REST 端点
+# ═══════════════════════════════════════════════════════════════════
+
+class MultiAgentRequest(BaseModel):
+    """POST /api/multi-agent 请求体"""
+    message: str = Field(..., description="用户输入的自然语言任务描述")
+    session_id: str | None = Field(
+        default=None,
+        description="会话 ID。不传则自动生成。"
+    )
+
+
+class MultiAgentResponse(BaseModel):
+    """POST /api/multi-agent 响应体"""
+    summary: str = Field(default="", description="聚合后的任务摘要")
+    success: bool = Field(default=True, description="所有步骤是否成功")
+    correlation_id: str = Field(default="", description="消息线程 ID（可追溯审计日志）")
+    backend: str = Field(default="multi-agent", description="后端标识")
+    steps: list = Field(default_factory=list, description="每个步骤的详细结果")
+    session_id: str = Field(default="", description="会话 ID")
+
+
+class MultiAgentStatusResponse(BaseModel):
+    """GET /api/multi-agent/status 响应体"""
+    is_running: bool = Field(default=False)
+    uptime_seconds: float = Field(default=0.0)
+    request_count: int = Field(default=0)
+    error_count: int = Field(default=0)
+    persistence_backend: str = Field(default="memory")
+    agents: dict = Field(default_factory=dict)
+    mailbox: dict = Field(default_factory=dict)
+    dead_letter_count: int = Field(default=0)
+    audit_log_size: int = Field(default=0)
+
+
+@router.post("/multi-agent", response_model=MultiAgentResponse)
+async def multi_agent(request: MultiAgentRequest):
+    """
+    POST /api/multi-agent — Phase 7 Multi-Agent + Mailbox 协作入口。
+
+    这是完整的多 Agent 协作端点，内部流程：
+      1. Router 分析请求复杂度（规则匹配 + LLM 兜底）
+      2. 简单任务 → 直接路由到 Coder / Tester / Reviewer
+      3. 复杂任务 → Planner 拆解 → 按依赖顺序分发到各 Agent
+      4. 收集所有 Agent 的 TASK_RESULT → 聚合返回
+
+    与 /api/chat 的区别：
+      - /api/chat:       单 Agent 或 LangGraph 工作流（Phase 1-3）
+      - /api/multi-agent: 6 个独立 Agent 通过 Mailbox 异步协作（Phase 7）
+
+    请求示例：
+      # 简单编码任务
+      curl -X POST /api/multi-agent -d '{"message": "创建 health check 端点"}'
+
+      # 复杂多步骤任务
+      curl -X POST /api/multi-agent -d '{
+        "message": "构建完整的 FastAPI User CRUD API，包含测试和 code review"
+      }'
+
+    追踪：
+      用返回的 correlation_id 查询审计日志：
+        GET /api/multi-agent/audit?correlation_id=user_abc12345
+    """
+    # 延迟导入，避免循环依赖
+    from main import multi_agent_orch
+
+    session_id = request.session_id or _new_session_id()
+
+    result = await multi_agent_orch.handle_user_request(request.message)
+
+    return MultiAgentResponse(
+        summary=result.get("summary", ""),
+        success=result.get("success", True),
+        correlation_id=result.get("correlation_id", ""),
+        backend="multi-agent",
+        steps=result.get("details", result.get("steps", [])),
+        session_id=session_id,
+    )
+
+
+@router.get("/multi-agent/status", response_model=MultiAgentStatusResponse)
+async def multi_agent_status():
+    """
+    GET /api/multi-agent/status — Multi-Agent 系统状态监控。
+
+    返回整个 Agent 池的运行状态，包括：
+      - 每个 Agent 的 Inbox 深度、已处理/失败消息数
+      - Mailbox 全局统计（路由消息数、广播数、失败数）
+      - 死信队列深度
+      - 审计日志大小
+
+    用于运维监控和健康检查。
+    """
+    from main import multi_agent_orch
+
+    stats = multi_agent_orch.get_stats()
+
+    return MultiAgentStatusResponse(
+        is_running=stats["system"]["is_running"],
+        uptime_seconds=stats["system"]["uptime_seconds"],
+        request_count=stats["system"]["request_count"],
+        error_count=stats["system"]["error_count"],
+        persistence_backend=multi_agent_orch.persistence_backend_name,
+        agents=stats["agents"],
+        mailbox=stats["mailbox"],
+        dead_letter_count=stats["mailbox"].get("dead_letter_count", 0),
+        audit_log_size=stats["audit_log_size"],
+    )
+
+
+@router.get("/multi-agent/audit")
+async def multi_agent_audit(
+    correlation_id: str = "",
+    agent_name: str = "",
+):
+    """
+    GET /api/multi-agent/audit — 消息审计日志查询。
+
+    Query Parameters:
+        correlation_id:  按线程 ID 过滤，查看一个完整任务的完整消息链路
+        agent_name:      按 Agent 名称过滤（router/planner/coder/tester/reviewer）
+
+    返回示例：
+        GET /api/multi-agent/audit?correlation_id=user_abc12345
+
+    每个审计条目包含：
+        timestamp, event (routing/delivered/broadcast_to_N_agents),
+        msg_id, sender, recipient, msg_type, priority
+
+    面试要点：
+      面试官："如何追踪一个任务的完整执行链路？"
+      答："每条消息有 correlation_id 做线程追踪。
+          MailboxManager 的审计日志记录了消息 sender/recipient/
+          timestamp/msg_type/priority。通过 GET /api/multi-agent/audit
+          可以按 correlation_id 或 agent_name 查询，完整回放
+          从用户请求到最终结果的整个消息链路。"
+    """
+    from main import multi_agent_orch
+
+    trail = multi_agent_orch.get_audit_trail(
+        correlation_id=correlation_id,
+        agent_name=agent_name,
+    )
+
+    return {
+        "count": len(trail),
+        "filters": {
+            "correlation_id": correlation_id,
+            "agent_name": agent_name,
+        },
+        "trail": trail,
+    }

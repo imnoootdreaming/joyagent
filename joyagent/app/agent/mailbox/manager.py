@@ -240,10 +240,17 @@ class MailboxManager:
         correlation_id: str = "",
         agent_name: str = "",
     ) -> list[dict]:
-        """查询审计日志（可按 correlation_id 或 agent_name 过滤）。"""
+        """
+        查询审计日志（可按 correlation_id 或 agent_name 过滤）。
+
+        correlation_id 使用前缀匹配（startswith），因为父级 cid（如
+        user_abc）的子步骤会使用 step-level cid（如 user_abc_s0、
+        user_abc_plan）。前缀匹配确保查询父级 cid 时能看到完整链路。
+        """
         result = self._audit_log
         if correlation_id:
-            result = [e for e in result if e["correlation_id"] == correlation_id]
+            result = [e for e in result
+                      if e["correlation_id"].startswith(correlation_id)]
         if agent_name:
             result = [
                 e for e in result
