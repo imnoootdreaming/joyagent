@@ -18,7 +18,10 @@ from app.agent.reviewer import ReviewerAgent
 from app.agent.router import RouterAgent
 
 # ── Step 5: MultiAgentOrchestrator ──
-from app.agent.orchestrator import MultiAgentOrchestrator, OrchestratorConfig
+from app.agent.orchestrator import MultiAgentOrchestrator, OrchestratorConfig, PersistenceBackend
+
+# ── Step 6: Persistence ──
+from app.agent.mailbox import FilePersistence, MemoryPersistence, RedisConfig, RedisPersistence
 
 __all__ = [
     # Base
@@ -42,4 +45,10 @@ __all__ = [
     # Step 5: MultiAgentOrchestrator
     "MultiAgentOrchestrator",
     "OrchestratorConfig",
+    "PersistenceBackend",
+    # Step 6: Persistence
+    "FilePersistence",
+    "MemoryPersistence",
+    "RedisConfig",
+    "RedisPersistence",
 ]

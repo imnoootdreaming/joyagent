@@ -34,6 +34,8 @@ from app.agent.mailbox.persistence import (
     FilePersistence,
     MailboxPersistence,
     MemoryPersistence,
+    RedisConfig,
+    RedisPersistence,
 )
 
 __all__ = [
@@ -51,4 +53,6 @@ __all__ = [
     "MailboxPersistence",
     "MemoryPersistence",
     "FilePersistence",
+    "RedisConfig",
+    "RedisPersistence",
 ]

@@ -277,6 +277,65 @@ class AgentInbox:
             ],
         }
 
+    # ── 持久化恢复（Step 6） ────────────────────────────
+
+    def load_envelopes(self, envelopes: list[dict]) -> int:
+        """
+        从持久化的 envelope 列表中恢复消息到 Inbox。
+
+        用于 FilePersistence / RedisPersistence 加载时调用。
+        每条消息通过 MailboxMessage.from_envelope() 反序列化，
+        然后投递到对应优先级队列。
+
+        恢复的消息状态保持原样（通常是 DELIVERED 或 READ），
+        watcher 启动后会自动 fetch_next() + process()。
+
+        Args:
+            envelopes: 消息 envelope 列表（每个是 to_envelope() 的输出）
+
+        Returns:
+            int: 成功加载的消息数量
+        """
+        loaded = 0
+        for data in envelopes:
+            try:
+                msg = MailboxMessage.from_envelope(data)
+                # 过期检查：跳过已经过期的消息
+                if msg.is_expired:
+                    msg.status = MessageStatus.EXPIRED
+                    self._dead_letter.append(msg)
+                    self._stats["expired"] += 1
+                    self._stats["dead_lettered"] += 1
+                    continue
+
+                # 已处理的消息不恢复（避免重复处理）
+                if msg.status == MessageStatus.PROCESSED:
+                    continue
+
+                # DRAFT / SENT 状态的消息在持久化前未被投递 → 标记为 DELIVERED
+                # 这样 fetch_unread() 和 watcher 可以正确拾取
+                if msg.status in (MessageStatus.DRAFT, MessageStatus.SENT):
+                    msg.status = MessageStatus.DELIVERED
+                    msg.delivered_at = time.time()
+
+                # 恢复到活跃队列
+                self._messages[msg.priority].append(msg)
+                self._stats["received"] += 1
+                loaded += 1
+            except Exception:
+                # 单条消息损坏不影响其他消息
+                continue
+
+        # 按时间戳排序（同优先级内 FIFO）
+        for priority in MessagePriority:
+            self._messages[priority].sort(key=lambda m: m.created_at)
+
+        # 如果有消息加载 → 通知 watcher
+        if loaded > 0:
+            self._new_message_event.set()
+
+        return loaded
+
     # ── 内部 ──────────────────────────────────────────
 
     def _move_to_dead_letter(self, msg: MailboxMessage) -> None:

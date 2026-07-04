@@ -27,23 +27,28 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from enum import Enum
+from typing import TYPE_CHECKING, Callable
 
 from app.agent.base import BaseAgent
 from app.agent.mailbox import (
+    FilePersistence,
     MailboxManager,
     MailboxMessage,
-    MessageType,
+    MailboxPersistence,
+    MemoryPersistence,
 )
 from app.agent.roles import (
-    AgentRole,
     ROLE_CODER,
     ROLE_PLANNER,
     ROLE_REVIEWER,
     ROLE_ROUTER,
     ROLE_TESTER,
 )
+
+if TYPE_CHECKING:
+    from app.agent.mailbox.persistence import RedisConfig
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -75,6 +80,24 @@ def _get_agent_class_map() -> dict[str, type[BaseAgent]]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 持久化后端枚举
+# ═══════════════════════════════════════════════════════════════════════
+
+class PersistenceBackend(str, Enum):
+    """
+    持久化后端类型 —— 控制 Inbox 消息如何持久化和恢复。
+
+    Attributes:
+        MEMORY: 不做持久化（Agent 重启后消息丢失）。默认值，用于开发和测试。
+        FILE:   本地 JSON 文件持久化。Agent 重启后可从文件恢复未处理消息。
+        REDIS:  Redis List 可靠队列 + Pub/Sub 广播。适合生产环境。
+    """
+    MEMORY = "memory"
+    FILE = "file"
+    REDIS = "redis"
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # 编排器配置
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -83,11 +106,24 @@ class OrchestratorConfig:
     """
     MultiAgentOrchestrator 的可调配置。
 
-    主要是超时和并发控制参数。Agent 角色定义从 AgentRole 获取，
-    不需要在这里重复。
+    包括超时、持久化后端、清理策略等。
     """
     # ── 超时 ──
     request_timeout: float = 300.0    # 单个用户请求总超时（秒）
+
+    # ── 持久化 ──
+    # 选择消息持久化后端：
+    #   "memory" — 不做持久化（默认）
+    #   "file"   — 本地 JSON 文件（data/mailbox/{owner}.json）
+    #   "redis"  — Redis List 可靠队列 + Pub/Sub 广播
+    persistence_backend: str = "memory"
+
+    # File 后端：持久化文件目录
+    persistence_path: str = "data/mailbox"
+
+    # Redis 后端：连接配置（仅在 backend="redis" 时使用）
+    # 可以传 RedisConfig 实例，也可以传 dict（会被转成 RedisConfig）
+    redis_config: dict | None = None  # RedisConfig | None
 
     # ── 清理 ──
     expire_sweep_interval: float = 60.0  # 过期消息清理间隔（秒），0 = 不自动清理
@@ -131,6 +167,9 @@ class MultiAgentOrchestrator:
         # ── 核心组件 ──
         self.mailbox = MailboxManager()
         self.agents: dict[str, BaseAgent] = {}
+
+        # ── 持久化 ──
+        self._persistence = self._init_persistence()
 
         # ── 后台任务 ──
         self._watcher_tasks: dict[str, asyncio.Task] = {}
@@ -207,19 +246,25 @@ class MultiAgentOrchestrator:
 
     async def start_all(self) -> None:
         """
-        后台启动所有 Agent 的 InboxWatcher。
+        后台启动所有 Agent 的 InboxWatcher + 从持久化恢复未处理消息。
 
         启动后，每个 Agent 开始监听自己的 Inbox，自动处理到达的消息。
         所有 Agent 并发运行（通过 asyncio 协程），互不阻塞。
 
         这是幂等的——多次调用不会重复启动已运行的 Agent。
+
+        Step 6: 如果启用了持久化（file/redis），启动时会自动加载
+        上次未处理的消息到各个 Agent 的 Inbox。
         """
+        # ── Step 6: 从持久化恢复消息 ──
+        await self._load_inboxes()
+
         tasks = {}
-        for name, agent in self.agents.items():
-            if name in self._watcher_tasks and not self._watcher_tasks[name].done():
+        for _name, agent in self.agents.items():
+            if _name in self._watcher_tasks and not self._watcher_tasks[_name].done():
                 continue
             task = agent.start_background()
-            tasks[name] = task
+            tasks[_name] = task
 
         self._watcher_tasks.update(tasks)
         self._started = True
@@ -236,12 +281,15 @@ class MultiAgentOrchestrator:
 
     async def stop_all(self) -> None:
         """
-        停止所有 Agent 的 InboxWatcher。
+        停止所有 Agent 的 InboxWatcher + 持久化未处理消息。
 
         停止后 Agent 不再处理新消息，但已注册的 Inbox/Outbox 仍保留
         （可以再次 start_all 恢复）。
+
+        Step 6: 如果启用了持久化（file/redis），停止前会自动保存
+        每个 Agent Inbox 中未处理的消息，下次 start_all 时恢复。
         """
-        for name, agent in self.agents.items():
+        for _name, agent in self.agents.items():
             agent.stop()
 
         # 取消 sweeper
@@ -254,7 +302,7 @@ class MultiAgentOrchestrator:
         self._sweeper_task = None
 
         # 等待所有 watcher 任务完成
-        for name, task in self._watcher_tasks.items():
+        for _name, task in self._watcher_tasks.items():
             if not task.done():
                 task.cancel()
                 try:
@@ -264,6 +312,9 @@ class MultiAgentOrchestrator:
 
         self._watcher_tasks.clear()
         self._started = False
+
+        # ── Step 6: 保存未处理消息到持久化 ──
+        await self._save_inboxes()
 
         if self.config.verbose:
             print(f"  [orchestrator] All agents stopped")
@@ -493,12 +544,102 @@ class MultiAgentOrchestrator:
         await self.start_all()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb):
         """Async context manager exit —— 自动关闭。"""
         await self.shutdown()
         return False  # 不吞异常
 
-    # ── 内部 ──────────────────────────────────────────────
+    # ── 内部：持久化 ────────────────────────────────────────
+
+    def _init_persistence(self) -> MailboxPersistence:
+        """
+        根据 config.persistence_backend 创建对应的持久化后端。
+
+        Returns:
+            MailboxPersistence 实例（Memory/File/Redis）。
+
+        使用方式——在 OrchestratorConfig 中设置:
+            # 纯内存（默认，消息不持久化）
+            config = OrchestratorConfig(persistence_backend="memory")
+
+            # 本地 JSON 文件（重启后恢复）
+            config = OrchestratorConfig(
+                persistence_backend="file",
+                persistence_path="data/mailbox",
+            )
+
+            # Redis List 队列（生产环境）
+            config = OrchestratorConfig(
+                persistence_backend="redis",
+                redis_config={"host": "localhost", "port": 6379},
+            )
+        """
+        backend = self.config.persistence_backend
+
+        if backend == PersistenceBackend.FILE:
+            return FilePersistence(path=self.config.persistence_path)
+
+        if backend == PersistenceBackend.REDIS:
+            try:
+                from app.agent.mailbox.persistence import RedisConfig, RedisPersistence  # noqa: F811
+            except ImportError:
+                if self.config.verbose:
+                    print("  [orchestrator] ⚠ redis package not installed — "
+                          "falling back to memory persistence")
+                return MemoryPersistence()
+
+            redis_cfg = self.config.redis_config or {}
+            if isinstance(redis_cfg, dict):
+                redis_cfg = RedisConfig(**redis_cfg)
+            return RedisPersistence(config=redis_cfg)
+
+        # "memory" 或未知值 → 不做持久化
+        return MemoryPersistence()
+
+    async def _save_inboxes(self) -> None:
+        """
+        将所有 Agent Inbox 中的未处理消息保存到持久化后端。
+
+        只保存状态为 DELIVERED/READ 的消息（未处理完成的）。
+        已处理（PROCESSED）或已失败的消息不保存。
+        """
+        if isinstance(self._persistence, MemoryPersistence):
+            return  # 纯内存 → 不保存
+
+        count = 0
+        for _name, agent in self.agents.items():
+            await self._persistence.save(agent.inbox)
+            unread = len(agent.inbox.fetch_unread())
+            count += unread
+
+        if count > 0 and self.config.verbose:
+            print(f"  [orchestrator] Persisted {count} unread messages "
+                  f"(backend={self.config.persistence_backend})")
+
+    async def _load_inboxes(self) -> None:
+        """
+        从持久化后端恢复所有 Agent Inbox 的未处理消息。
+
+        每个 Agent 的 Inbox 恢复后，watcher 启动时会自动处理这些消息。
+        """
+        if isinstance(self._persistence, MemoryPersistence):
+            return  # 纯内存 → 无数据可恢复
+
+        count = 0
+        for _name, agent in self.agents.items():
+            envelopes = await self._persistence.load(agent.inbox.owner)
+            if envelopes:
+                loaded = agent.inbox.load_envelopes(envelopes)
+                count += loaded
+
+        if count > 0 and self.config.verbose:
+            print(f"  [orchestrator] Restored {count} messages from persistence "
+                  f"(backend={self.config.persistence_backend})")
+
+    @property
+    def persistence_backend_name(self) -> str:
+        """当前使用的持久化后端名称（用于调试）。"""
+        return self.config.persistence_backend
 
     async def _sweep_loop(self, interval: float) -> None:
         """后台过期消息清理循环。"""
