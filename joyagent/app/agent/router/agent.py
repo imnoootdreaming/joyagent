@@ -27,7 +27,7 @@ import json
 import uuid
 from typing import Any
 
-from app.agent.base import BaseAgent, extract_text
+from app.agent.base import BaseAgent, extract_json, extract_text
 from app.agent.mailbox import (
     MailboxManager,
     MailboxMessage,
@@ -248,17 +248,14 @@ class RouterAgent(BaseAgent):
 
         规则匹配失败时的兜底策略。
         """
-        model_name = self.role.model or Config.DEFAULT_MODEL
-        prompt = ROUTER_ANALYSIS_PROMPT.format(user_message=user_message)
+        prompt = ROUTER_ANALYSIS_PROMPT.replace("{user_message}", user_message)
 
         try:
-            response = self.client.messages.create(
-                model=model_name,
+            text = await self._call_llm(
                 system=self.role.system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=1024,
             )
-            text = extract_text(response.content)
             return self._parse_analysis(text)
         except Exception:
             # LLM 调用失败 → 默认走 Planner（安全策略）
@@ -328,9 +325,30 @@ class RouterAgent(BaseAgent):
                 "success": False,
             }
 
+        # 防御性：处理 Tester/Reviewer 可能返回两封信的情况（status + result）
+        merged = {}
+        for r in results:
+            merged.setdefault("agent", r.get("agent", "unknown"))
+            if r.get("error"):
+                merged["error"] = r["error"]
+                merged["success"] = False
+            if r.get("summary"):
+                merged["summary"] = r["summary"]
+            if r.get("verdict"):
+                merged["verdict"] = r["verdict"]
+            if r.get("passed") is not None:
+                merged["passed"] = r["passed"]
+            if r.get("success") is False:
+                merged["success"] = False
+            if "files_created" in r:
+                merged["files_created"] = r["files_created"]
+
+        if not merged:
+            merged = results[0] if results else {"error": "No result", "success": False}
+
         return {
-            "steps": results,
-            "success": all(r.get("success", True) for r in results),
+            "steps": [merged],
+            "success": merged.get("success", True),
         }
 
     # ── 复杂任务：经 Planner 拆解 ─────────────────────────────
@@ -426,7 +444,8 @@ class RouterAgent(BaseAgent):
                     "step": step_num,
                     "agent": target,
                     "task": task,
-                    **result,
+                    "success": result.get("success", True),
+                    **{k: v for k, v in result.items() if k != "success"},
                 })
                 if not result.get("success", True):
                     all_success = False
@@ -513,36 +532,28 @@ class RouterAgent(BaseAgent):
             return {"summary": "No steps were executed.", "details": []}
 
         if len(steps) <= 2:
-            # 简单情况：直接拼接
             lines = []
             for s in steps:
                 agent = s.get("agent", "unknown")
                 if s.get("error"):
                     lines.append(f"❌ {agent}: {s['error']}")
                 else:
-                    summary = s.get("summary", s.get("output", "Completed"))
-                    lines.append(f"✅ {agent}: {summary}")
-            return {
-                "summary": "\n".join(lines),
-                "details": steps,
-            }
+                    s_summary = s.get("summary") or s.get("output") or "Completed"
+                    lines.append(f"✅ {agent}: {s_summary}")
+            return {"summary": "\n".join(lines), "details": steps}
 
         # 复杂情况：调用 LLM 聚合
-        model_name = self.role.model or Config.DEFAULT_MODEL
         agent_results_str = json.dumps(steps, indent=2, ensure_ascii=False)
-        prompt = ROUTER_AGGREGATION_PROMPT.format(
-            user_message=user_message,
-            agent_results=agent_results_str,
-        )
+        prompt = (ROUTER_AGGREGATION_PROMPT
+                  .replace("{user_message}", user_message)
+                  .replace("{agent_results}", agent_results_str))
 
         try:
-            response = self.client.messages.create(
-                model=model_name,
+            text = await self._call_llm(
                 system=self.role.system_prompt,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=2048,
             )
-            text = extract_text(response.content)
             return {"summary": text, "details": steps}
         except Exception:
             # LLM 失败 → 降级为简单拼接
@@ -635,22 +646,10 @@ class RouterAgent(BaseAgent):
 
     @staticmethod
     def _parse_analysis(text: str) -> dict:
-        """从 LLM 响应中解析路由分析结果。"""
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "complexity": "complex",
-            "reasoning": "Could not parse LLM analysis — defaulting to Planner",
-            "route": {
-                "target": "planner",
-                "task": text[:200],
-                "priority": "normal",
-            },
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"complexity": "complex",
+                    "reasoning": "Could not parse — default to Planner",
+                    "route": {"target": "planner", "task": text[:200],
+                              "priority": "normal"}}
+        return result

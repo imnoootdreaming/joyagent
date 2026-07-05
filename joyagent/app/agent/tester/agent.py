@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.base import BaseAgent, extract_text
+from app.agent.base import BaseAgent, extract_json, extract_text
 from app.agent.mailbox import (
     MailboxManager,
     MailboxMessage,
@@ -72,22 +72,17 @@ class TesterAgent(BaseAgent):
             dict: {"passed": bool, "failures": [...], "summary": "..."}
         """
         model_name = self.role.model or Config.DEFAULT_MODEL
-        # 提取 focus 信息（如果有的话）
         focus = ""
         if isinstance(task, dict):
             focus = task.get("focus", "")
             task = task.get("task", str(task))
-        prompt = TESTER_EXECUTION_PROMPT.format(task=task, focus=focus)
+        prompt = TESTER_EXECUTION_PROMPT.replace("{task}", task).replace("{focus}", focus)
 
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
             messages=[{"role": "user", "content": prompt}],
-            tools=self.tools,
             max_tokens=4096,
         )
-
-        text = extract_text(response.content)
         result = self._parse_test_result(text)
         return {
             **result,
@@ -174,23 +169,10 @@ class TesterAgent(BaseAgent):
     # ── 解析辅助 ──────────────────────────────────────────
 
     @staticmethod
+    @staticmethod
     def _parse_test_result(text: str) -> dict:
-        """从 LLM 响应中解析测试结果。"""
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "passed": False,
-            "total_tests": 0,
-            "passed_count": 0,
-            "failed_count": 1,
-            "failures": [{"test": "parse_error", "error": "Could not parse LLM response"}],
-            "summary": text[:200],
-            "raw_output": text,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"passed": False, "total_tests": 0, "passed_count": 0,
+                    "failed_count": 1, "failures": [], "summary": text[:200]}
+        return result

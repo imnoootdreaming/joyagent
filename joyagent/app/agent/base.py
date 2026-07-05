@@ -19,6 +19,7 @@ Phase 7 Step 2 — BaseAgent 基类（集成 Mailbox 通信）
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import TYPE_CHECKING
 
 from app.agent.mailbox import (
@@ -40,6 +41,36 @@ if TYPE_CHECKING:
 # ═══════════════════════════════════════════════════════════════════════
 # 工具函数
 # ═══════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════
+# JSON 提取工具 —— 所有 Agent 共用
+# ═══════════════════════════════════════════════════════════════════════
+
+def extract_json(text: str) -> dict:
+    """
+    从 LLM 响应文本中提取 JSON 对象。比简单的 find('{')/rfind('}')
+    更健壮——忽略 markdown 代码块、跳过前导说明文字。
+
+    策略：
+      1. 去除 markdown ```json ... ``` 代码块标记
+      2. 找到第一个 { 和最后一个 }
+      3. json.loads 解析，失败返回 fallback dict
+    """
+    import re
+    # 去掉 markdown 代码块
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = text.replace('```', '')
+
+    start = text.find('{')
+    end = text.rfind('}')
+    if start != -1 and end != -1 and end > start:
+        json_str = text[start:end + 1]
+        try:
+            return json.loads(json_str)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {"_parse_error": True, "raw_text": text.strip()}
+
 
 def extract_text(content: list) -> str:
     """
@@ -154,15 +185,26 @@ class BaseAgent:
         处理 TASK_ASSIGNMENT 消息 —— 子类覆盖此方法实现具体逻辑。
 
         默认实现：调用 run() 然后回复 TASK_RESULT。
+        run() 失败时仍发 TASK_RESULT（含错误信息）给 sender，避免 sender 永久等待。
         """
         task = msg.body if isinstance(msg.body, str) else msg.body.get("task", "")
         subject = (
             msg.subject
             or (msg.body.get("subject", "") if isinstance(msg.body, dict) else "")
         )
-        print(f"  [{self.agent_id}] TASK_ASSIGNMENT received: {subject or task[:80]}")
+        print(f"  [{self.agent_id}] TASK_ASSIGNMENT received: {subject or task[:80]}",
+              flush=True)
 
-        result = await self.run(task)
+        try:
+            result = await self.run(task)
+        except Exception as e:
+            print(f"  [{self.agent_id}] run() FAILED: {type(e).__name__}: {e}",
+                  flush=True)
+            result = {
+                "error": f"{type(e).__name__}: {e}",
+                "agent": self.agent_id,
+                "success": False,
+            }
 
         reply = self.outbox.create_message(
             recipient=msg.sender,
@@ -173,7 +215,7 @@ class BaseAgent:
             reply_to=msg.id,
         )
         await self.outbox.send(reply)
-        print(f"  [{self.agent_id}] TASK_RESULT sent → {msg.sender}")
+        print(f"  [{self.agent_id}] TASK_RESULT sent → {msg.sender}", flush=True)
         return True
 
     async def _handle_status_query(self, msg: MailboxMessage) -> bool:
@@ -199,6 +241,40 @@ class BaseAgent:
 
     # ── Agent 主逻辑（子类必须覆盖） ───────────────────────
 
+    async def _call_llm(
+        self,
+        system: str,
+        messages: list[dict],
+        max_tokens: int = 4096,
+        timeout: float = 30.0,
+    ) -> str:
+        model_name = self.role.model or Config.DEFAULT_MODEL
+
+        def _sync_call():
+            return self.client.messages.create(
+                model=model_name,
+                system=system,
+                messages=messages,
+                tools=self.tools,
+                max_tokens=max_tokens,
+                timeout=timeout,
+            )
+
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(_sync_call),
+                timeout=timeout + 10,
+            )
+            return extract_text(response.content)
+        except asyncio.TimeoutError:
+            print(f"  [{self.agent_id}] LLM call TIMEOUT ({timeout}s)",
+                  flush=True)
+            raise
+        except Exception as e:
+            print(f"  [{self.agent_id}] LLM call FAILED: {type(e).__name__}: {e}",
+                  flush=True)
+            raise
+
     async def run(self, task: str) -> dict:
         """
         Agent 主逻辑。子类覆盖此方法。
@@ -211,16 +287,12 @@ class BaseAgent:
         Returns:
             dict: 任务结果（作为 TASK_RESULT 的 body 发送回 Router）
         """
-        model_name = self.role.model or Config.DEFAULT_MODEL
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
             messages=[{"role": "user", "content": f"Task: {task}"}],
-            tools=self.tools,
-            max_tokens=4096,
         )
         return {
-            "output": extract_text(response.content),
+            "output": text,
             "agent": self.agent_id,
         }
 

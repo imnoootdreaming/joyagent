@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.base import BaseAgent, extract_text
+from app.agent.base import BaseAgent, extract_json, extract_text
 from app.agent.mailbox import (
     MailboxManager,
     MailboxMessage,
@@ -70,18 +70,24 @@ class PlannerAgent(BaseAgent):
             dict: {"plan": [...], "summary": "...", "estimated_time": "..."}
         """
         model_name = self.role.model or Config.DEFAULT_MODEL
-        prompt = PLANNER_TASK_DECOMPOSE_PROMPT.format(task=task)
+        prompt_text = PLANNER_TASK_DECOMPOSE_PROMPT.replace("{task}", task)
 
-        response = self.client.messages.create(
-            model=model_name,
-            system=self.role.system_prompt,
-            messages=[{"role": "user", "content": prompt}],
-            tools=self.tools,
-            max_tokens=4096,
-        )
+        try:
+            text = await self._call_llm(
+                system=self.role.system_prompt,
+                messages=[{"role": "user", "content": prompt_text}],
+                max_tokens=4096,
+            )
+            plan = self._parse_plan(text)
+        except Exception as e:
+            print(f"  [{self.agent_id}] LLM call failed: {e} — "
+                  f"returning fallback plan", flush=True)
+            plan = {
+                "summary": f"Fallback plan for: {task[:60]}",
+                "steps": [{"step": 1, "agent": "coder", "task": task}],
+                "estimated_time": "unknown",
+            }
 
-        text = extract_text(response.content)
-        plan = self._parse_plan(text)
         return {
             **plan,
             "agent": self.agent_id,
@@ -108,22 +114,19 @@ class PlannerAgent(BaseAgent):
 
         # 调用 LLM 进行仲裁
         model_name = self.role.model or Config.DEFAULT_MODEL
-        prompt = PLANNER_CONFLICT_ARBITRATION_PROMPT.format(
-            issue=issue,
-            agent_a=agent_a,
-            claim_a=claim_a,
-            agent_b=agent_b,
-            claim_b=claim_b,
-        )
+        prompt_text = (PLANNER_CONFLICT_ARBITRATION_PROMPT
+                       .replace("{issue}", issue)
+                       .replace("{agent_a}", agent_a)
+                       .replace("{claim_a}", claim_a)
+                       .replace("{agent_b}", agent_b)
+                       .replace("{claim_b}", claim_b))
 
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content": prompt_text}],
             max_tokens=2048,
         )
 
-        text = extract_text(response.content)
         decision = self._parse_decision(text)
 
         # 将仲裁结果发送回冲突发起方
@@ -149,48 +152,17 @@ class PlannerAgent(BaseAgent):
 
     @staticmethod
     def _parse_plan(text: str) -> dict:
-        """
-        从 LLM 响应中解析结构化计划。
-
-        尝试从响应中提取 JSON。失败时返回原始文本。
-        """
-        try:
-            # 找到第一个 { 和最后一个 }
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        # Fallback: 返回原始文本作为非结构化计划
-        return {
-            "summary": "Plan (unstructured)",
-            "steps": [{"step": 1, "agent": "coder", "task": text}],
-            "estimated_time": "unknown",
-            "raw_output": text,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"summary": "Plan (unstructured)",
+                    "steps": [{"step": 1, "agent": "coder", "task": text}],
+                    "estimated_time": "unknown", "raw_output": text}
+        return result
 
     @staticmethod
     def _parse_decision(text: str) -> dict:
-        """
-        从 LLM 响应中解析仲裁决策。
-
-        尝试从响应中提取 JSON。失败时返回原始文本。
-        """
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "decision": text.strip(),
-            "reasoning": "Parsed from unstructured response",
-            "action": "review decision text above",
-            "compromise": None,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"decision": text.strip(), "reasoning": "Unstructured",
+                    "action": "review", "compromise": None}
+        return result

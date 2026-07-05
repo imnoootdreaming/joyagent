@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.base import BaseAgent, extract_text
+from app.agent.base import BaseAgent, extract_json, extract_text
 from app.agent.mailbox import (
     MailboxManager,
     MailboxMessage,
@@ -69,22 +69,17 @@ class ReviewerAgent(BaseAgent):
         Returns:
             dict: {"verdict": "LGTM|NEEDS_WORK|REJECT", "issues": [...], ...}
         """
-        model_name = self.role.model or Config.DEFAULT_MODEL
         focus = ""
         if isinstance(task, dict):
             focus = task.get("focus", "")
             task = task.get("task", str(task))
-        prompt = REVIEWER_CODE_REVIEW_PROMPT.format(task=task, focus=focus)
+        prompt = REVIEWER_CODE_REVIEW_PROMPT.replace("{task}", task).replace("{focus}", focus)
 
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
             messages=[{"role": "user", "content": prompt}],
-            tools=self.tools,
             max_tokens=4096,
         )
-
-        text = extract_text(response.content)
         result = self._parse_review_result(text)
         return {
             **result,
@@ -185,21 +180,8 @@ class ReviewerAgent(BaseAgent):
 
     @staticmethod
     def _parse_review_result(text: str) -> dict:
-        """从 LLM 响应中解析审查结果。"""
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "verdict": "NEEDS_WORK",
-            "scores": {},
-            "issues": [],
-            "praise": [],
-            "summary": text[:200],
-            "raw_output": text,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"verdict": "NEEDS_WORK", "scores": {}, "issues": [],
+                    "praise": [], "summary": text[:200]}
+        return result

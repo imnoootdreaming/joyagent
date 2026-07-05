@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 
-from app.agent.base import BaseAgent, extract_text
+from app.agent.base import BaseAgent, extract_json, extract_text
 from app.agent.mailbox import (
     MailboxManager,
     MailboxMessage,
@@ -72,18 +72,13 @@ class CoderAgent(BaseAgent):
         Returns:
             dict: {"files_created": [...], "files_modified": [...], ...}
         """
-        model_name = self.role.model or Config.DEFAULT_MODEL
-        prompt = CODER_TASK_PROMPT.format(task=task)
+        prompt = CODER_TASK_PROMPT.replace("{task}", task)
 
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
             messages=[{"role": "user", "content": prompt}],
-            tools=self.tools,
             max_tokens=8192,
         )
-
-        text = extract_text(response.content)
         result = self._parse_code_result(text)
         return {
             **result,
@@ -122,23 +117,18 @@ class CoderAgent(BaseAgent):
         print(f"  [{self.agent_id}] REVIEW_FEEDBACK received: {msg.subject[:80]}")
 
         # 调用 LLM 处理反馈
-        model_name = self.role.model or Config.DEFAULT_MODEL
-        prompt = CODER_REVIEW_FEEDBACK_PROMPT.format(
-            original_task=original_task or "Unknown",
-            feedback=json.dumps(feedback, indent=2, ensure_ascii=False)
-            if isinstance(feedback, (dict, list))
-            else str(feedback),
-        )
+        fb_text = (json.dumps(feedback, indent=2, ensure_ascii=False)
+                   if isinstance(feedback, (dict, list))
+                   else str(feedback))
+        prompt = (CODER_REVIEW_FEEDBACK_PROMPT
+                  .replace("{original_task}", original_task or "Unknown")
+                  .replace("{feedback}", fb_text))
 
-        response = self.client.messages.create(
-            model=model_name,
+        text = await self._call_llm(
             system=self.role.system_prompt,
             messages=[{"role": "user", "content": prompt}],
-            tools=self.tools,
             max_tokens=8192,
         )
-
-        text = extract_text(response.content)
         result = self._parse_feedback_result(text)
 
         # 回复发送方
@@ -158,39 +148,16 @@ class CoderAgent(BaseAgent):
 
     @staticmethod
     def _parse_code_result(text: str) -> dict:
-        """从 LLM 响应中解析代码生成结果。"""
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "files_created": [],
-            "files_modified": [],
-            "summary": text[:200],
-            "notes": "Parsed from unstructured response",
-            "raw_output": text,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"files_created": [], "files_modified": [],
+                    "summary": text[:200], "raw_output": text}
+        return result
 
     @staticmethod
     def _parse_feedback_result(text: str) -> dict:
-        """从 LLM 响应中解析反馈处理结果。"""
-        try:
-            start = text.find("{")
-            end = text.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                json_str = text[start:end + 1]
-                return json.loads(json_str)
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-        return {
-            "changes_made": [],
-            "issues_declined": [],
-            "summary": text[:200],
-            "raw_output": text,
-        }
+        result = extract_json(text)
+        if result.get("_parse_error"):
+            return {"changes_made": [], "issues_declined": [],
+                    "summary": text[:200], "raw_output": text}
+        return result

@@ -2,10 +2,13 @@
 Phase 7 Step 4 — Router Agent Prompts
 
 Router 专用的请求分析、路由决策和结果聚合模板。
+
+注意：模板使用 {placeholder} 标记，调用方用 .replace() 替换，
+不用 str.format() —— 避免 prompt 中的 JSON 示例被误解析。
 """
 
 # ═══════════════════════════════════════════════════════════════════════
-# 请求分析 Prompt（判断简单/复杂 + 路由目标）
+# 请求分析 Prompt
 # ═══════════════════════════════════════════════════════════════════════
 
 ROUTER_ANALYSIS_PROMPT = """You are a traffic controller for a multi-agent coding system. Your job is to analyze the user's request and decide how to route it.
@@ -23,15 +26,15 @@ ROUTER_ANALYSIS_PROMPT = """You are a traffic controller for a multi-agent codin
 Analyze the request and return a routing decision as JSON:
 
 ```json
-{{
+{
   "complexity": "simple|complex",
   "reasoning": "Brief explanation of your routing decision",
-  "route": {{
+  "route": {
     "target": "coder|tester|reviewer|planner",
     "task": "The task description to send to the target agent",
     "priority": "normal|high"
-  }}
-}}
+  }
+}
 ```
 
 ## Routing Rules
@@ -71,9 +74,9 @@ Synthesize a clear, concise summary. Format:
 [2-3 sentence summary of what was accomplished]
 
 ## Steps Completed
-- ✅ [step description] — by {agent}
-- ✅ [step description] — by {agent}
-- ❌ [step description] — by {agent} (if any failed)
+- ✅ [step description] — by [agent]
+- ✅ [step description] — by [agent]
+- ❌ [step description] — by [agent] (if any failed)
 
 ## Final Result
 [Overall outcome. If all passed: success message. If some failed: what went wrong and next steps.]

@@ -648,8 +648,10 @@ async def multi_agent(request: MultiAgentRequest):
       用返回的 correlation_id 查询审计日志：
         GET /api/multi-agent/audit?correlation_id=user_abc12345
     """
-    # 延迟导入，避免循环依赖
-    from main import multi_agent_orch
+    # 延迟导入——使用 sys.modules 避免 __main__ vs main 双模块问题
+    # python main.py 启动时模块叫 __main__，不能用 from main import
+    import sys
+    multi_agent_orch = sys.modules["__main__"].multi_agent_orch
 
     session_id = request.session_id or _new_session_id()
 

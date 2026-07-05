@@ -37,7 +37,10 @@ ENV HF_HUB_OFFLINE=1
 ENV SANDBOX_HOST_MOUNT_PATH=/mnt/hgfs/joyagent
 
 COPY . .
+# 清除构建时的 __pycache__ + 禁止 Python 写入新 .pyc（避免代码更新后被旧缓存覆盖）
+RUN find /app -name '*.pyc' -delete && find /app -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; true
+ENV PYTHONDONTWRITEBYTECODE=1
 
 EXPOSE 8000
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "find /app -name '*.pyc' -delete 2>/dev/null; find /app -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; exec python -B main.py"]

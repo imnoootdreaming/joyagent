@@ -190,7 +190,7 @@ class MultiAgentOrchestrator:
 
     def register_all(self, agent_class_map: dict[str, type[BaseAgent]] | None = None) -> None:
         """
-        创建并注册所有 Agent 到 MailboxManager。
+        创建并注册所有 Agent 到 MailboxManager（幂等——已注册的跳过）。
 
         按 AGENT_ROLES 中的定义，为每种角色创建一个 Agent 实例。
         每个 Agent 自动获得独立的 Inbox/Outbox 并注册到 MailboxManager。
@@ -208,7 +208,13 @@ class MultiAgentOrchestrator:
             "reviewer": ROLE_REVIEWER,
         }
 
+        added = []
+        skipped = []
         for role_name, role in roles.items():
+            if role_name in self.agents:
+                skipped.append(role_name)
+                continue
+
             agent_cls = class_map.get(role_name)
             if agent_cls is None:
                 if self.config.verbose:
@@ -217,11 +223,15 @@ class MultiAgentOrchestrator:
 
             agent = agent_cls(role, self.mailbox, agent_id=role_name)
             self.agents[role_name] = agent
+            added.append(role_name)
 
         if self.config.verbose:
-            registered = self.mailbox.registered_agents
-            print(f"  [orchestrator] {len(self.agents)} agents registered: "
-                  f"{', '.join(registered)}")
+            if skipped:
+                print(f"  [orchestrator] {len(skipped)} already registered: "
+                      f"{', '.join(skipped)} (skipped)")
+            if added:
+                print(f"  [orchestrator] {len(added)} agents registered: "
+                      f"{', '.join(added)}")
 
     def register_agent(
         self,
