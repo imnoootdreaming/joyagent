@@ -101,22 +101,18 @@ docker logs joyagent | tail -50
 ```
 [startup] cleaned N cached .pyc/__pycache__
 [OK] Registered 14 tools: ...
+[HITL] Auto-approve mode — set HITL_REQUIRE_APPROVAL=true for strict mode
 [OK] ToolRegistry initialized.
-[mailbox] Agent 'router' registered (inbox handlers: ...)
-[mailbox] Agent 'planner' registered (inbox handlers: ...)
-[mailbox] Agent 'coder' registered (inbox handlers: ...)
-[mailbox] Agent 'tester' registered (inbox handlers: ...)
-[mailbox] Agent 'reviewer' registered (inbox handlers: ...)
+[db] SQLite initialized: ./data/joyagent.db
+[task_queue] Redis unavailable: ... — falling back to mock
+[mailbox] Agent 'router' registered ...
 [orchestrator] 5 agents registered: router, planner, coder, tester, reviewer
-[router] Watcher started (background, task=Task-3)
-[planner] Watcher started (background, task=Task-4)
-[coder] Watcher started (background, task=Task-5)
-[tester] Watcher started (background, task=Task-6)
-[reviewer] Watcher started (background, task=Task-7)
 [orchestrator] All 5 agents started (background)
 [OK] Multi-Agent system online (backend=file)
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://0.0.0.0:8000 (Press CTRL+C to quit)
+[mcp:joyagent-demo] Connected — 3 tools: get_weather, calculate, get_time
+[mcp:adapter] 3 MCP tools registered
+[OK] Phase 8 MCP: 3 tools registered (servers: joyagent-demo)
+INFO:     Uvicorn running on http://0.0.0.0:8000
 ```
 
 ---
@@ -155,6 +151,28 @@ curl "http://宿主机IP:8000/api/multi-agent/audit?correlation_id=user_abc12345
 curl -X POST http://宿主机IP:8000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"message": "读取 main.py 文件"}'
+```
+
+### 5.5 测试 MCP 工具（Phase 8 Demo Server）
+
+```bash
+# Demo Server 的 calculate 工具
+curl -X POST http://宿主机IP:8000/api/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "用 calculate 工具计算 123 * 456"}'
+```
+
+---
+
+## Human-in-the-Loop 权限说明
+
+默认**自动放行模式**（`HITL_REQUIRE_APPROVAL` 未设置）。
+Docker Sandbox 已经提供了六层安全隔离，所以 CONFIRM 级工具（write_file、
+execute_shell）默认放行，但 DENY 级操作（rm -rf、sudo）仍被拦截。
+
+```bash
+# 严格模式（需要外部审批者时才启用）
+docker run -d ... -e HITL_REQUIRE_APPROVAL=true joyagent:latest
 ```
 
 ---

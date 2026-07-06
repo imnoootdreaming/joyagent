@@ -92,8 +92,17 @@ def register_all_tools():
     tool_registry.register_hook(tool_safety)
 
     # ── 注册 Human-in-the-Loop 权限管理器 ──
+    # 无外部审批者时自动放行 CONFIRM 级工具（Docker Sandbox 已提供安全隔离）
+    # 设置 HITL_REQUIRE_APPROVAL=true 可启用严格模式（需 WebSocket 审批者）
+    import os as _os
     from app.core.permissions import PermissionManager
-    tool_registry.register_hook(PermissionManager())
+    _hitl = PermissionManager(
+        auto_approve_in_test=not _os.getenv("HITL_REQUIRE_APPROVAL"),
+    )
+    tool_registry.register_hook(_hitl)
+    if _hitl._auto_approve:
+        print("  [HITL] Auto-approve mode — set HITL_REQUIRE_APPROVAL=true for strict mode",
+              flush=True)
 
     # ── 注册统计收集器 Hook ──
     tool_registry.register_hook(tool_stats)
