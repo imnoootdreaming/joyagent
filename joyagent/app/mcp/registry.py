@@ -27,7 +27,6 @@ MCP Registry 是多个 MCP Server 连接的集中管理中心。
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
 
 from app.mcp.client import MCPClient
 from app.mcp.schemas import (

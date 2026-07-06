@@ -293,6 +293,8 @@ class MCPClient:
         """
         # 构建环境变量
         env = os.environ.copy()
+        # 强制子进程输出 UTF-8（Windows 默认不是 UTF-8）
+        env["PYTHONIOENCODING"] = "utf-8"
         if self.config.env:
             env.update(self.config.env)
 

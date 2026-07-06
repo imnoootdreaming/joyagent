@@ -11,6 +11,7 @@ MCP Client 端实现。使用纯 Python JSON-RPC 2.0 over stdio 与
   - MCPClient:         单个 MCP Server 的客户端
   - MCPRegistry:       管理多个 MCP Server 连接
   - mcp_registry:      全局单例
+  - DEMO_MCP_CONFIG:   自建 Demo Server 的连接配置
 """
 
 from app.mcp.schemas import (
@@ -21,6 +22,7 @@ from app.mcp.schemas import (
 )
 from app.mcp.client import MCPClient
 from app.mcp.registry import MCPRegistry, mcp_registry
+from app.mcp.demo_server import DEMO_MCP_CONFIG
 
 __all__ = [
     "MCPServerConfig",
@@ -30,4 +32,5 @@ __all__ = [
     "MCPClient",
     "MCPRegistry",
     "mcp_registry",
+    "DEMO_MCP_CONFIG",
 ]
