@@ -85,6 +85,10 @@ async def lifespan(app: FastAPI):
         register_all_tools()
         print("  [OK] ToolRegistry initialized.", flush=True)
 
+        # Phase 9: 初始化数据库
+        from app.db.session import init_db
+        init_db()
+
         # Phase 7: 初始化并启动多 Agent 系统
         multi_agent_orch.register_all()
         await multi_agent_orch.start_all()
@@ -137,6 +141,13 @@ async def lifespan(app: FastAPI):
     yield  # ← 应用运行中
 
     # ── Shutdown ──
+    try:
+        from app.db.session import dispose_engine
+        dispose_engine()
+        print("  [shutdown] Database connections closed.", flush=True)
+    except Exception:
+        pass
+
     try:
         print("  [shutdown] Stopping MCP servers...", flush=True)
         from app.mcp.registry import mcp_registry
