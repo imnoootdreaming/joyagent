@@ -90,14 +90,33 @@ async def lifespan(app: FastAPI):
         await multi_agent_orch.start_all()
         print(f"  [OK] Multi-Agent system online "
               f"(backend={multi_agent_orch.persistence_backend_name})", flush=True)
+
+        # Phase 8: 初始化 MCP Server + 注册 MCP 工具
+        from app.mcp.registry import mcp_registry
+        from app.mcp.demo_server import DEMO_MCP_CONFIG
+        from app.mcp.adapter import register_mcp_tools
+        mcp_registry.add_server(DEMO_MCP_CONFIG)
+        await mcp_registry.start_all()
+        mcp_count = await register_mcp_tools(mcp_registry)
+        if mcp_count > 0:
+            print(f"  [OK] Phase 8 MCP: {mcp_count} tools registered "
+                  f"(servers: {mcp_registry.connected_server_names})", flush=True)
     except Exception:
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
-        print("  [WARN] Multi-Agent startup failed — continuing without it", flush=True)
+        print("  [WARN] Startup failed — continuing without it", flush=True)
 
     yield  # ← 应用运行中
 
     # ── Shutdown ──
+    try:
+        print("  [shutdown] Stopping MCP servers...", flush=True)
+        from app.mcp.registry import mcp_registry
+        await mcp_registry.shutdown()
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+
     try:
         print("  [shutdown] Stopping Multi-Agent system...", flush=True)
         await multi_agent_orch.shutdown()

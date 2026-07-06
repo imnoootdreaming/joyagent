@@ -17,7 +17,7 @@ DEMO_MCP_CONFIG = MCPServerConfig(
     name="joyagent-demo",
     command="python",
     args=["-m", "app.mcp.demo_server.server"],
-    auto_connect=False,
+    auto_connect=True,
     description="JoyAgent Demo MCP Server — Weather + Calculator + Clock",
 )
 

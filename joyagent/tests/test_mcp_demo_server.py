@@ -124,9 +124,9 @@ class TestDemoConfig:
     def test_config_command_is_python(self):
         assert "python" in DEMO_MCP_CONFIG.command
 
-    def test_config_auto_connect_false(self):
-        """Demo server 默认不自动连接。"""
-        assert DEMO_MCP_CONFIG.auto_connect is False
+    def test_config_auto_connect_true(self):
+        """Demo server 启动时自动连接。"""
+        assert DEMO_MCP_CONFIG.auto_connect is True
 
 
 # ═══════════════════════════════════════════════════════════════════════
