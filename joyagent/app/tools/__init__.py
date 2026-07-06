@@ -88,8 +88,12 @@ def register_all_tools():
     # Memory 工具（Phase 6 — 长期记忆）
     tool_registry.register_tool(RememberTool())        # 保存/检索长期记忆
 
-    # ── 注册安全检查器 Hook（在统计收集器之前） ──
+    # ── 注册安全检查器 Hook（在 PermissionManager 之前） ──
     tool_registry.register_hook(tool_safety)
+
+    # ── 注册 Human-in-the-Loop 权限管理器 ──
+    from app.core.permissions import PermissionManager
+    tool_registry.register_hook(PermissionManager())
 
     # ── 注册统计收集器 Hook ──
     tool_registry.register_hook(tool_stats)
