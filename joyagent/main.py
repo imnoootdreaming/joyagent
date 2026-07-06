@@ -94,9 +94,37 @@ async def lifespan(app: FastAPI):
         # Phase 8: 初始化 MCP Server + 注册 MCP 工具
         from app.mcp.registry import mcp_registry
         from app.mcp.demo_server import DEMO_MCP_CONFIG
+        from app.mcp.adapters import (
+            GITHUB_MCP_CONFIG,
+            POSTGRES_MCP_CONFIG,
+            FILESYSTEM_MCP_CONFIG,
+        )
         from app.mcp.adapter import register_mcp_tools
-        mcp_registry.add_server(DEMO_MCP_CONFIG)
+        from app.mcp.adapters.github import get_github_token_status
+
+        # 注册所有 MCP Server
+        mcp_registry.add_servers([
+            DEMO_MCP_CONFIG,
+            GITHUB_MCP_CONFIG,
+            POSTGRES_MCP_CONFIG,
+            FILESYSTEM_MCP_CONFIG,
+        ])
         await mcp_registry.start_all()
+
+        # 给用户反馈哪些 Server 连接成功了
+        for name in ("joyagent-demo", "github", "filesystem", "postgres"):
+            cfg = {"joyagent-demo": DEMO_MCP_CONFIG,
+                   "github": GITHUB_MCP_CONFIG,
+                   "postgres": POSTGRES_MCP_CONFIG,
+                   "filesystem": FILESYSTEM_MCP_CONFIG}[name]
+            if cfg.auto_connect and name not in mcp_registry.connected_server_names:
+                if name == "github":
+                    print(f"  [mcp] ⚠ GitHub MCP skipped — "
+                          f"Token: {get_github_token_status()}", flush=True)
+                elif name == "postgres":
+                    print(f"  [mcp] ⚠ PostgreSQL MCP skipped — "
+                          f"DATABASE_URL not set", flush=True)
+
         mcp_count = await register_mcp_tools(mcp_registry)
         if mcp_count > 0:
             print(f"  [OK] Phase 8 MCP: {mcp_count} tools registered "
