@@ -276,35 +276,43 @@ class MemoryManager:
 
     async def before_llm_call(self) -> bool:
         """
-        每次 LLM 调用前调用 —— 检查是否需要压缩上下文。
+        每次 LLM 调用前调用 —— 四层压缩管线。
+
+        执行顺序: L3(tool_result_budget) → L1(snip_compact) →
+                  L2(micro_compact) → (still over?) → L4(compress)
+
+        "便宜的先跑，贵的后跑" — L1/L2/L3 都是 0 API，
+        L4 是 1 次 LLM 调用（递进式摘要）。
 
         Returns:
-            True 如果执行了压缩（调用方可能需要刷新 messages 引用）
-
-        Example:
-            await mm.before_llm_call()
-            response = client.messages.create(
-                messages=mm.get_context(),  # 使用压缩后的上下文
-                ...
-            )
+            True 如果执行了 L4 压缩（调用方需刷新 messages 引用）
         """
         self._llm_call_count += 1
 
-        # ── 检查 Token 是否接近限制 ──
+        # ── 三层 0-API 压缩管线 ──
+        compacted = self.stm.run_cheap_compaction()
+        if any(v > 0 for v in compacted.values()):
+            detail = ", ".join(f"{k}={v}" for k, v in compacted.items()
+                               if v > 0)
+            print(f"  [memory] cheap compaction: {detail}", flush=True)
+
+        # ── 还不够？L4: LLM 递进式摘要 ──
         if self.tm.should_compress(self.stm.messages, self.model):
             try:
                 await self.stm.compress(self.model)
                 print(
-                    f"  [memory_manager] auto-compressed STM "
-                    f"(msgs={len(self.stm.messages)}, "
-                    f"summary={len(self.stm.summary)} chars)"
+                    f"  [memory] L4 progressive summary — "
+                    f"msgs={len(self.stm.messages)}, "
+                    f"summary={len(self.stm.summary)} chars",
+                    flush=True,
                 )
                 return True
             except Exception as e:
-                print(f"  [memory_manager] compress failed (non-fatal): {e}")
-                # 降级：紧急截断
-                if len(self.stm.messages) > self.stm.max_messages:
-                    self.stm.messages = self.stm.messages[-self.stm.max_messages:]
+                print(f"  [memory] L4 compress failed (non-fatal): {e}", flush=True)
+                # 降级: 紧急截断
+                self.stm.reactive_truncate()
+                print(f"  [memory] reactive truncate — "
+                      f"msgs={len(self.stm.messages)}", flush=True)
 
         return False
 

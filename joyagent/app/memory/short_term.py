@@ -1,58 +1,22 @@
 from __future__ import annotations
 """
-Phase 6 Step 3b: Short-term Memory — 滑动窗口 + 递进式摘要压缩。
+Phase 6 Step 3b: Short-term Memory — 四层上下文压缩管线。
 
-ShortTermMemory 管理单个 Agent 会话的工作记忆。它实现两层策略：
-  1. 滑动窗口 — 只保留最近 N 条消息（默认 50），防止对话历史无限膨胀
-  2. 递进式摘要 — 当 Token 数超过阈值时，将旧消息压缩为 LLM 生成的摘要
+ShortTermMemory 管理单个 Agent 会话的工作记忆，实现四层压缩策略：
 
-与 Long-term Memory 的区别：
-  Short-term Memory 是"当前会话的工作台"——Agent 用它来跟踪本轮对话的上下文。
-  会话结束后数据不持久化。Long-term Memory 是"跨会话的知识库"——持久化到
-  ChromaDB，下次启动时可检索。
+  L3: tool_result_budget        — 大结果(>200KB)落盘，上下文只留预览
+  L1: snip_compact              — 保留头 3 + 尾 47，裁掉中间无关对话
+  L2: micro_compact             — 旧工具结果替换为占位符，只保留最近 3 条
+  L4: 递进式摘要（compress）     — LLM 生成递进式摘要（O(1) 而非 O(n)）
+  应急: reactive_truncate        — API 报 prompt_too_long 时暴力截断
 
-设计原则：
-  ┌───────────────────────────────────────────────────────┐
-  │  ShortTermMemory 内部状态                              │
-  │                                                       │
-  │  messages: [msg50, msg51, ..., msg99]  ← 滑动窗口      │
-  │  summary:  "Step 1-3 完成了用户管理模块..."  ← 递进摘要 │
-  │                                                       │
-  │  get_context() 返回:                                   │
-  │    [summary_msg, msg80, msg81, ..., msg99]             │
-  │    ↑ 摘要注入为 user 消息      ↑ 最近 50 条原始消息      │
-  └───────────────────────────────────────────────────────┘
-
-与 LangGraph 的兼容性：
-  get_context() 返回纯 dict 列表，不包含 system prompt。
-  摘要作为 user 消息注入（{"role": "user", "content": "[Summary]: ..."}），
-  而非放在 system 参数中。这样 LangGraph 的 add_messages reducer 能正确
-  处理它（system prompt 由 Agent 层单独传给 client.messages.create(system=...))。
-
-使用方法：
-  from app.memory.short_term import ShortTermMemory
-  from app.memory.token_manager import get_token_manager
-
-  stm = ShortTermMemory(max_messages=50)
-  tm = get_token_manager()
-
-  # 在 ReAct Loop 中
-  stm.add_message({"role": "user", "content": "创建一个文件"})
-  # LLM 响应后...
-  stm.add_message({"role": "assistant", "content": [TextBlock(...)]})
-
-  # 需要压缩时
-  if tm.should_compress(stm.messages, model="claude-sonnet-4-6"):
-      await stm.compress()
-
-  # 构建 LLM 上下文
-  context = stm.get_context()
-  response = client.messages.create(
-      model=MODEL,
-      system=SYSTEM_PROMPT,     # system 是独立参数
-      messages=context,          # context = [summary_msg] + recent_msgs
-  )
+设计理念（Claude Code 标准）：
+  "便宜的先跑，贵的后跑" — L3/L1/L2 都是 0 API 调用的纯文本操作，
+  全部跑完后 token 仍超阈值才触发 L4（1 次 LLM 调用）。
+  执行顺序: L3 → L1 → L2 → (still over?) → L4
 """
+
+
 
 # ── Python 标准库 ──
 import asyncio
@@ -433,3 +397,248 @@ class ShortTermMemory:
             "last_compression_at": None,
             "last_compression_msg_count": 0,
         }
+
+    # ── 四层压缩管线 ──────────────────────────────────────────
+    # 设计理念: "便宜的先跑，贵的后跑"
+    # L1/L2/L3 都是 0 API 调用的纯文本操作，L4 才调 LLM
+    # 执行顺序: L3 → L1 → L2 → (still over?) → L4
+
+    def tool_result_budget(self, max_bytes: int = 200_000) -> int:
+        """
+        L3: 大工具结果落盘——最贵的文本操作最先跑（保护后续裁剪）。
+
+        统计最后一条 user 消息里所有 tool_result 的总大小。
+        超过 max_bytes → 按大小排序，从最大的开始落盘到
+        data/tool_outputs/，上下文里只留 <persisted-output> 标记
+        + 前 2000 字符预览。
+
+        必须最先跑：因为 L2（micro_compact）会把旧的大 tool_result
+        替换成一行占位符，budget 需要在被替换前把完整内容落盘。
+
+        Args:
+            max_bytes: 单条 user 消息的 tool_result 总大小上限（字符数）
+
+        Returns:
+            落盘的文件数（0 = 不需要）
+        """
+        import os
+        import hashlib
+
+        if not self.messages:
+            return 0
+
+        persisted = 0
+        output_dir = os.path.join("data", "tool_outputs")
+        os.makedirs(output_dir, exist_ok=True)
+
+        for msg in self.messages:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+
+            # 收集所有 tool_result blocks
+            blocks = [(i, b) for i, b in enumerate(content)
+                      if isinstance(b, dict) and b.get("type") == "tool_result"]
+            if not blocks:
+                continue
+
+            total = sum(len(str(b[1].get("content", ""))) for b in blocks)
+            if total <= max_bytes:
+                continue
+
+            # 按大小降序——最大的先落盘
+            ranked = sorted(blocks, key=lambda p: len(str(p[1].get("content", ""))),
+                            reverse=True)
+            for idx, block in ranked:
+                if total <= max_bytes:
+                    break
+                raw = str(block.get("content", ""))
+                if len(raw) < 500:
+                    continue  # 太小不值得落盘
+
+                # 落盘
+                tid = block.get("tool_use_id", f"unknown_{idx}")
+                file_hash = hashlib.md5(raw.encode()).hexdigest()[:8]
+                disk_path = os.path.join(output_dir,
+                                         f"tool_{tid}_{file_hash}.txt")
+                with open(disk_path, "w", encoding="utf-8") as f:
+                    f.write(raw)
+
+                # 上下文里只留标记 + 预览
+                preview = raw[:2000]
+                block["content"] = (
+                    f"<persisted-output file='{disk_path}'>\n"
+                    f"{preview}\n"
+                    f"... ({len(raw) - len(preview)} more chars)"
+                    f"</persisted-output>"
+                )
+                total = sum(len(str(b[1].get("content", ""))) for b in blocks)
+                persisted += 1
+
+        if persisted:
+            self._stats.setdefault("tool_outputs_persisted", 0)
+            self._stats["tool_outputs_persisted"] += persisted
+        return persisted
+
+    def micro_compact(self, keep_recent: int = 3) -> int:
+        """
+        L2: 旧工具结果占位——只保留最近 keep_recent 条完整内容。
+
+        Agent 连续读了 10 个文件。第 1-7 次的完整内容还躺在上下文里，
+        早就不需要了，但占着大量空间。将更旧的 tool_result 替换为
+        "[Earlier tool result compacted. Re-run if needed.]"
+
+        必须在 L3 之后跑：L3 已经把大结果落盘了，L2 把旧结果
+        替换为占位符释放上下文。不在白名单中的工具（如 read_file
+        的 FILE_UNCHANGED_STUB）不压缩——可以用 metadata 跳过。
+
+        Args:
+            keep_recent: 保留最近几条完整 tool_result
+
+        Returns:
+            替换的块数
+        """
+        if not self.messages:
+            return 0
+
+        replaced = 0
+        tool_result_blocks: list[tuple[int, int, dict]] = []  # (msg_i, block_i, block)
+        for mi, msg in enumerate(self.messages):
+            content = msg.get("content", "")
+            if not isinstance(content, list):
+                continue
+            for bi, block in enumerate(content):
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_result_blocks.append((mi, bi, block))
+
+        if len(tool_result_blocks) <= keep_recent:
+            return 0
+
+        to_replace = tool_result_blocks[:-keep_recent]
+        for _mi, _bi, block in to_replace:
+            raw = str(block.get("content", ""))
+            if len(raw) > 120:
+                block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
+                replaced += 1
+
+        if replaced:
+            self._stats.setdefault("micro_compactions", 0)
+            self._stats["micro_compactions"] += replaced
+        return replaced
+
+    def snip_compact(self, max_messages: int = 50) -> int:
+        """
+        L1: 裁掉无关的旧对话——保留头部 3 条 + 尾部 (max-3) 条。
+
+        消息超过 max_messages → 保留头 3（初始上下文: system/user/task）
+        和尾 (max-3)（当前工作），中间裁掉。切口保护：不会把
+        assistant(tool_use) 和紧接的 user(tool_result) 拆开。
+
+        Args:
+            max_messages: 触发裁剪的阈值
+
+        Returns:
+            裁掉的消息数（0 = 不需要）
+        """
+        if len(self.messages) <= max_messages:
+            return 0
+
+        head_keep = 3
+        tail_keep = max_messages - head_keep
+        head_end = head_keep
+        tail_start = len(self.messages) - tail_keep
+
+        # 切口保护: head 末端不能是拆开的 tool_use → tool_result
+        head_msg = self.messages[head_end - 1]
+        if _msg_has_tool_use(head_msg):
+            while head_end < len(self.messages) and _is_tool_result_message(self.messages[head_end]):
+                head_end += 1
+
+        # tail 开头不能是孤立的 tool_result
+        if _is_tool_result_message(self.messages[tail_start]) and \
+           _msg_has_tool_use(self.messages[tail_start - 1]):
+            tail_start -= 1
+
+        snipped = tail_start - head_end
+        if snipped <= 0:
+            return 0
+
+        placeholder = {
+            "role": "user",
+            "content": f"[snipped {snipped} messages from conversation middle]",
+        }
+        self.messages = (
+            self.messages[:head_end]
+            + [placeholder]
+            + self.messages[tail_start:]
+        )
+        self._stats.setdefault("snip_compactions", 0)
+        self._stats["snip_compactions"] += snipped
+        return snipped
+
+    def reactive_truncate(self) -> int:
+        """
+        应急: API 返回 prompt_too_long (413) 时暴力截断。
+
+        compact_history 可能还来不及跑——上下文增长速度快于压缩触发速度。
+        此时从尾部保留最后 10 条消息，丢弃前面所有，
+        但仍要避免留下孤立的 tool_result 无对应的 tool_use。
+
+        Returns:
+            丢弃的消息数
+        """
+        if len(self.messages) <= 10:
+            return 0
+
+        tail_start = max(0, len(self.messages) - 10)
+        if _is_tool_result_message(self.messages[tail_start]) and \
+           _msg_has_tool_use(self.messages[tail_start - 1]):
+            tail_start -= 1
+
+        discarded = len(self.messages) - (len(self.messages) - tail_start)
+        self.messages = self.messages[tail_start:]
+        self._stats.setdefault("reactive_truncations", 0)
+        self._stats["reactive_truncations"] += discarded
+        return discarded
+
+    def run_cheap_compaction(self) -> dict:
+        """
+        运行三层 0-API 压缩管线: L3 → L1 → L2。
+
+        返回每个操作的计数，用于日志。
+        """
+        result = {}
+        result["budget_files"] = self.tool_result_budget()
+        result["snipped"] = self.snip_compact(self.max_messages)
+        result["micro_replaced"] = self.micro_compact(keep_recent=3)
+        return result
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 辅助: 消息类型判断
+# ═══════════════════════════════════════════════════════════════════════
+
+def _msg_has_tool_use(msg: dict) -> bool:
+    """消息的 content 列表中是否包含 tool_use block。"""
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    return any(
+        (isinstance(b, dict) and b.get("type") == "tool_use")
+        for b in content
+    )
+
+
+def _is_tool_result_message(msg: dict) -> bool:
+    """消息是否为 user 角色且包含 tool_result block。"""
+    if msg.get("role") != "user":
+        return False
+    content = msg.get("content", "")
+    if not isinstance(content, list):
+        return False
+    return any(
+        (isinstance(b, dict) and b.get("type") == "tool_result")
+        for b in content
+    )
