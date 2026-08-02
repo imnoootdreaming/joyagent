@@ -1,5 +1,5 @@
 from __future__ import annotations
-from app.agent.prompt import SYSTEM_PROMPT
+from app.agent.prompt import build_system_prompt
 from app.service.llm_service import get_or_create_client
 from app.tools.registry import tool_registry
 from app.core.config import Config
@@ -98,9 +98,16 @@ class Agent:
 
             # ── 1. 调用 LLM ──
             try:
+                # 取最近一条用户消息文本，用于动态匹配并挂载 Skill
+                user_req = ""
+                for msg in reversed(messages):
+                    if msg.get("role") == "user":
+                        c = msg.get("content", "")
+                        user_req = c if isinstance(c, str) else str(c)
+                        break
                 response = self.client.messages.create(
                     model=self.model_name,
-                    system=SYSTEM_PROMPT,       # system 是独立参数
+                    system=build_system_prompt(user_request=user_req),
                     messages=messages,           # 纯 dict 列表
                     tools=tool_registry.get_tool_schemas(),  # ⬅ Phase 2: Registry
                     max_tokens=max_tokens,

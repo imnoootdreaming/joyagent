@@ -1,7 +1,11 @@
 # Anthropic API 的 system prompt 是独立字符串参数，传给 client.messages.create(system=...)
 # 不作为消息列表的一部分。Anthropic 建议 system prompt 用纯文本而非 dict/JSON。
 # TODO - 后续 prompt 考虑用 dict 提前定义，之后再根据需要进行组装
-SYSTEM_PROMPT = """You are an autonomous coding agent, similar to Claude Code — an AI-powered software engineering tool.
+
+# 可插拔 Skill 机制：运行时按场景动态挂载 Skill 到 System Prompt。
+from app.skills.loader import skill_loader
+
+BASE_SYSTEM_PROMPT = """You are an autonomous coding agent, similar to Claude Code — an AI-powered software engineering tool.
 
 ## Your capabilities
 
@@ -36,3 +40,30 @@ SYSTEM_PROMPT = """You are an autonomous coding agent, similar to Claude Code �
 - When you use a tool, wait for its result before responding.
 - If you encounter an error, explain it and try to fix it.
 """
+
+
+def build_system_prompt(user_request: str = "") -> str:
+    """
+    动态组装 System Prompt：基础 Prompt + 命中的 Skill 段落。
+
+    Args:
+        user_request: 用户请求文本，用于自动匹配应启用的 Skill。
+                     为空时仅返回基础 Prompt（含全部内置 Skill 列表说明）。
+
+    Returns:
+        完整 System Prompt 字符串（可直接传给 client.messages.create(system=...)）。
+    """
+    base = BASE_SYSTEM_PROMPT
+
+    # 自动匹配 + 渲染 Skill
+    matched = skill_loader.match(user_request)
+    skill_block = skill_loader.render_for(matched)
+
+    # 若无可匹配请求，仍暴露全部可用 Skill 的能力边界（供模型按需调用）
+    if not matched:
+        all_block = skill_loader.render_for(
+            [skill_loader.get(n) for n in skill_loader.names if skill_loader.get(n)]
+        )
+        skill_block = all_block
+
+    return base + skill_block

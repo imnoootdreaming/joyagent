@@ -110,6 +110,7 @@ async def lifespan(app: FastAPI):
             GITHUB_MCP_CONFIG,
             POSTGRES_MCP_CONFIG,
             FILESYSTEM_MCP_CONFIG,
+            ZOTERO_MCP_CONFIG,
         )
         from app.mcp.adapter import register_mcp_tools
         from app.mcp.adapters.github import get_github_token_status
@@ -120,15 +121,17 @@ async def lifespan(app: FastAPI):
             GITHUB_MCP_CONFIG,
             POSTGRES_MCP_CONFIG,
             FILESYSTEM_MCP_CONFIG,
+            ZOTERO_MCP_CONFIG,
         ])
         await mcp_registry.start_all()
 
         # 给用户反馈哪些 Server 连接成功了
-        for name in ("joyagent-demo", "github", "filesystem", "postgres"):
+        for name in ("joyagent-demo", "github", "filesystem", "postgres", "zotero"):
             cfg = {"joyagent-demo": DEMO_MCP_CONFIG,
                    "github": GITHUB_MCP_CONFIG,
                    "postgres": POSTGRES_MCP_CONFIG,
-                   "filesystem": FILESYSTEM_MCP_CONFIG}[name]
+                   "filesystem": FILESYSTEM_MCP_CONFIG,
+                   "zotero": ZOTERO_MCP_CONFIG}[name]
             if cfg.auto_connect and name not in mcp_registry.connected_server_names:
                 if name == "github":
                     print(f"  [mcp] ⚠ GitHub MCP skipped — "
