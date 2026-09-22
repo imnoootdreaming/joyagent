@@ -102,7 +102,21 @@
 </p>
 
 <script>
-let sessionId = crypto.randomUUID().slice(0, 12);
+// session_id 生成器
+// crypto.randomUUID() 只在「安全上下文」可用（https 或 localhost）。
+// 通过 http://192.168.x.x:8000 这种局域网 IP 访问时它是 undefined，
+// 会导致脚本首行抛异常、后续所有事件监听都绑不上（表现为点击无反应）。
+// 所以这里做降级：用 getRandomValues（不安全上下文同样可用）。
+function newSessionId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID().slice(0, 12);
+  }
+  const bytes = new Uint8Array(6);
+  window.crypto.getRandomValues(bytes);
+  return Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+}
+
+let sessionId = newSessionId();
 
 // ══════════════════ 工具函数 ══════════════════
 

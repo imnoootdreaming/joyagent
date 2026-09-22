@@ -147,7 +147,13 @@ async def lifespan(app: FastAPI):
             print(f"  [OK] Phase 8 MCP: {mcp_count} tools registered "
                   f"(servers: {mcp_registry.connected_server_names})", flush=True)
 
-        # RAG: 预热知识库（建集合 + 打印规模；失败不影响主流程）
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.flush()
+        print("  [WARN] Startup failed — continuing without it", flush=True)
+
+    # ── RAG: 预热知识库（独立 try：不受 DB / MCP / Multi-Agent 启动失败影响）──
+    try:
         if Config.RAG_ENABLED:
             from app.rag.store import get_knowledge_store
             kb = get_knowledge_store()
@@ -160,7 +166,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
-        print("  [WARN] Startup failed — continuing without it", flush=True)
+        print("  [WARN] RAG warm-up failed — /api/rag/* 不可用，但对话不受影响", flush=True)
 
     yield  # ← 应用运行中
 

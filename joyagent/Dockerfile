@@ -29,6 +29,7 @@ RUN uv pip install --system \
     "numpy>=1.26,<2.0" \
     "scikit-learn>=1.3,<1.6" \
     "sentence-transformers>=4.0,<5.0" \
+    "sqlalchemy>=2.0.0" \
     "tiktoken>=0.13.0" \
     "uvicorn>=0.49.0"
 
