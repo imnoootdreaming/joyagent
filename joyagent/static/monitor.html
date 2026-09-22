@@ -2,56 +2,337 @@
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>JoyAgent Workflow Monitor</title>
-<style>
-  body { font-family: monospace; background: #1e1e1e; color: #d4d4d4; padding: 20px; }
-  #log { white-space: pre-wrap; line-height: 1.6; }
-  .start  { color: #569cd6; }  /* 蓝 — Node 开始 */
-  .done   { color: #6a9955; }  /* 绿 — Node 完成 */
-  .route  { color: #dcdcaa; }  /* 黄 — 路由 */
-  .end    { color: #ce9178; }  /* 橙 — 结束 */
-  .error  { color: #f44747; }  /* 红 — 错误 */
-  #status { color: #4ec9b0; font-size: 14px; margin-bottom: 12px; }
-  h2 { color: #c586c0; }
-  input { padding: 6px 12px; margin-right: 8px; }
-  button { padding: 6px 16px; cursor: pointer; }
-</style>
+<link rel="stylesheet" href="/static/monitor.css">
 </head>
 <body>
-<h2>JoyAgent Workflow Monitor</h2>
-<p><input id="msg" value="列出当前目录的文件" size="50">
-   <button onclick="start()">发送</button></p>
-<p id="status">⚫ 未连接</p>
-<pre id="log"></pre>
+
+<!-- ══════════ 顶部标题栏 ══════════ -->
+<header class="app-header">
+  <div>
+    <h1 class="app-title"><span class="dot"></span>JoyAgent Workflow Monitor</h1>
+    <p class="app-subtitle">LangGraph Plan → Execute → Reflect · 实时进度 + RAG 知识库检索</p>
+  </div>
+  <div id="kbBadge" class="kb-badge" title="知识库状态">
+    <span class="kb-name" id="kbName">knowledge</span>
+    <span class="kb-stat" id="kbStat">加载中…</span>
+  </div>
+</header>
+
+<div class="layout">
+
+  <!-- ══════════ 左栏：RAG 知识库控制台 ══════════ -->
+  <div class="column">
+
+    <!-- RAG 开关 -->
+    <section class="panel">
+      <h2 class="panel-title">RAG 检索增强</h2>
+      <p class="panel-hint">开启后，每次对话会自动从知识库检索相关片段注入上下文，并在下方「引用来源」中展示出处。</p>
+      <div class="switch-row" id="ragRow">
+        <div>
+          <span class="label">启用 RAG</span>
+          <span class="desc">关闭时行为与原来完全一致</span>
+        </div>
+        <label class="switch">
+          <input type="checkbox" id="ragToggle">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </section>
+
+    <!-- 入库 -->
+    <section class="panel">
+      <h2 class="panel-title">知识库入库</h2>
+      <p class="panel-hint">支持 .md / .txt / 代码文件等文本类；重复上传同名文件会覆盖旧内容。</p>
+
+      <div class="dropzone" id="dropzone">
+        <span class="dz-main">点击选择文件，或拖拽到此处</span>
+        <span class="dz-sub">支持多选 · 单个文件 ≤ 8 MB</span>
+      </div>
+      <input type="file" id="fileInput" multiple hidden>
+
+      <div class="field">
+        <input class="input" id="dirPath" placeholder="本地目录绝对路径，如 /workspace/docs">
+        <button class="btn" id="btnDir">导入目录</button>
+      </div>
+
+      <div class="feedback" id="ingestFeedback"></div>
+    </section>
+
+    <!-- 检索测试 -->
+    <section class="panel">
+      <h2 class="panel-title">检索测试</h2>
+      <p class="panel-hint">不经过 Agent，直接检验知识库的召回效果。</p>
+      <div class="field">
+        <input class="input" id="searchQuery" placeholder="输入要检索的问题…">
+        <button class="btn" id="btnSearch">
+          <span class="spinner"></span><span>检索</span>
+        </button>
+      </div>
+      <div class="feedback" id="searchFeedback"></div>
+      <div class="hit-list" id="hitList" style="margin-top:12px"></div>
+    </section>
+
+  </div>
+
+  <!-- ══════════ 右栏：任务执行 + 日志 + 引用来源 ══════════ -->
+  <div class="column">
+
+    <section class="panel log-panel">
+      <h2 class="panel-title">任务执行</h2>
+      <div class="field" style="margin-top:0">
+        <input class="input" id="msg" value="列出当前目录的文件">
+        <button class="btn btn-primary" id="btnSend">发送</button>
+      </div>
+      <p id="status" style="margin-top:12px">⚫ 未连接</p>
+      <pre id="log"></pre>
+    </section>
+
+    <section class="panel">
+      <h2 class="panel-title">引用来源 <span id="sourceCount" style="color:#808080;font-weight:400"></span></h2>
+      <div id="sources"></div>
+    </section>
+
+  </div>
+</div>
+
+<p class="footer-note">
+  提示：session_id 由浏览器生成并同时用于 HTTP 与 WebSocket 通道，两者的事件才能正确关联。
+</p>
 
 <script>
 let sessionId = crypto.randomUUID().slice(0, 12);
 
+// ══════════════════ 工具函数 ══════════════════
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+async function apiUpload(files) {
+  const form = new FormData();
+  for (const f of files) form.append("files", f);
+  const res = await fetch("/api/rag/ingest", {method: "POST", body: form});
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function setLoading(btn, loading) {
+  btn.classList.toggle("is-loading", loading);
+  btn.disabled = loading;
+}
+
+function feedback(el, text, kind) {
+  el.textContent = text || "";
+  el.className = "feedback show" + (kind ? " " + kind : "");
+}
+
 function log(type, text) {
   const el = document.getElementById("log");
-  el.innerHTML += `<span class="${type}">[${new Date().toLocaleTimeString()}] ${text}</span>\n`;
+  const ts = new Date().toLocaleTimeString();
+  el.innerHTML += `<span class="line ${type}"><span class="ts">[${ts}]</span> ${esc(text)}</span>\n`;
   el.scrollTop = el.scrollHeight;
 }
 
-function start() {
-  document.getElementById("log").innerHTML = "";
+// ══════════════════ 知识库状态徽标 ══════════════════
 
-  // 1. 发 HTTP 请求触发工作流（不等待结果）
-  const msg = document.getElementById("msg").value;
-  fetch("/api/chat", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({message: msg, force_workflow: true, session_id: sessionId}),
+async function refreshKbStatus() {
+  const badge = document.getElementById("kbBadge");
+  try {
+    const res = await fetch("/api/rag/health");
+    const h = await res.json();
+    if (!h.ok || !h.enabled) {
+      badge.classList.add("is-off");
+      document.getElementById("kbName").textContent = h.collection || "knowledge";
+      document.getElementById("kbStat").textContent = h.enabled ? "不可用" : "已禁用";
+      return;
+    }
+    badge.classList.remove("is-off");
+    document.getElementById("kbName").textContent = h.collection;
+    document.getElementById("kbStat").textContent =
+      `${h.documents} 文档 / ${h.chunks} 切片`;
+  } catch (e) {
+    badge.classList.add("is-off");
+    document.getElementById("kbStat").textContent = "接口不可用";
+  }
+}
+
+// ══════════════════ 入库 ══════════════════
+
+const dropzone = document.getElementById("dropzone");
+const fileInput = document.getElementById("fileInput");
+const ingestFeedback = document.getElementById("ingestFeedback");
+
+dropzone.addEventListener("click", () => fileInput.click());
+
+["dragenter", "dragover"].forEach(ev =>
+  dropzone.addEventListener(ev, e => {
+    e.preventDefault();
+    dropzone.classList.add("is-dragover");
+  })
+);
+["dragleave", "drop"].forEach(ev =>
+  dropzone.addEventListener(ev, e => {
+    e.preventDefault();
+    dropzone.classList.remove("is-dragover");
+  })
+);
+dropzone.addEventListener("drop", e => {
+  const files = e.dataTransfer && e.dataTransfer.files;
+  if (files && files.length) uploadFiles(files);
+});
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) uploadFiles(fileInput.files);
+  fileInput.value = "";
+});
+
+async function uploadFiles(files) {
+  feedback(ingestFeedback, `正在入库 ${files.length} 个文件…`);
+  try {
+    const r = await apiUpload(files);
+    let text = `✓ 入库完成：${r.documents} 文档 / ${r.chunks} 切片（${r.elapsed_ms} ms）`;
+    if (r.skipped && r.skipped.length) text += ` · 跳过 ${r.skipped.length} 项`;
+    feedback(ingestFeedback, text, "ok");
+    (r.skipped || []).forEach(s => log("route", `跳过：${s}`));
+    refreshKbStatus();
+  } catch (e) {
+    feedback(ingestFeedback, `✗ 入库失败：${e.message}`, "error");
+  }
+}
+
+document.getElementById("btnDir").addEventListener("click", async () => {
+  const btn = document.getElementById("btnDir");
+  const path = document.getElementById("dirPath").value.trim();
+  if (!path) { feedback(ingestFeedback, "请先填写目录路径", "error"); return; }
+  setLoading(btn, true);
+  feedback(ingestFeedback, `正在扫描并入库 ${path} …`);
+  try {
+    const r = await apiPost("/api/rag/ingest/dir", {path});
+    let text = `✓ 导入完成：${r.documents} 文档 / ${r.chunks} 切片（${r.elapsed_ms} ms）`;
+    if (r.skipped && r.skipped.length) text += ` · 跳过 ${r.skipped.length} 项`;
+    feedback(ingestFeedback, text, "ok");
+    (r.skipped || []).forEach(s => log("route", `跳过：${s}`));
+    refreshKbStatus();
+  } catch (e) {
+    feedback(ingestFeedback, `✗ 导入失败：${e.message}`, "error");
+  } finally {
+    setLoading(btn, false);
+  }
+});
+
+// ══════════════════ 检索测试 ══════════════════
+
+document.getElementById("btnSearch").addEventListener("click", async () => {
+  const btn = document.getElementById("btnSearch");
+  const query = document.getElementById("searchQuery").value.trim();
+  const list = document.getElementById("hitList");
+  if (!query) { feedback(document.getElementById("searchFeedback"), "请输入检索内容", "error"); return; }
+
+  setLoading(btn, true);
+  feedback(document.getElementById("searchFeedback"), "检索中…");
+  try {
+    const r = await apiPost("/api/rag/search", {query, top_k: 5});
+    feedback(document.getElementById("searchFeedback"),
+             `命中 ${r.count} 条（${r.elapsed_ms} ms）`, r.count ? "ok" : "");
+    list.innerHTML = renderHits(r.hits || []);
+  } catch (e) {
+    feedback(document.getElementById("searchFeedback"), `✗ 检索失败：${e.message}`, "error");
+  } finally {
+    setLoading(btn, false);
+  }
+});
+
+function renderHits(hits) {
+  if (!hits.length) return `<div class="empty-state">没有命中 —— 先往知识库里导入文档，或降低相似度阈值</div>`;
+  return hits.map(h => `
+    <div class="hit">
+      <div class="hit-head">
+        <span class="hit-source">${esc(h.source)}</span>
+        <span class="hit-score">${(h.score * 100).toFixed(1)}%</span>
+      </div>
+      ${h.heading_path ? `<div class="hit-path">§ ${esc(h.heading_path)}</div>` : ""}
+      <div class="hit-bar"><i style="width:${Math.max(2, Math.min(100, h.score * 100))}%"></i></div>
+      <pre class="hit-body">${esc(h.content)}</pre>
+    </div>`).join("");
+}
+
+// ══════════════════ 引用来源 ══════════════════
+
+function renderSources(sources) {
+  const box = document.getElementById("sources");
+  const count = document.getElementById("sourceCount");
+  count.textContent = sources.length ? `（${sources.length}）` : "";
+  if (!sources.length) {
+    box.innerHTML = `<div class="empty-state">本次对话未使用知识库内容</div>`;
+    return;
+  }
+  box.innerHTML = sources.map((s, i) => `
+    <details class="source-item" ${i === 0 ? "open" : ""}>
+      <summary>
+        <span class="src-name">${esc(s.source)}</span>
+        <span class="src-badge">${(s.score * 100).toFixed(1)}%</span>
+      </summary>
+      <pre class="src-body">${esc(s.content)}</pre>
+    </details>`).join("");
+}
+
+// ══════════════════ RAG 开关联动 ══════════════════
+
+document.getElementById("ragToggle").addEventListener("change", e => {
+  document.getElementById("ragRow").classList.toggle("is-on", e.target.checked);
+});
+
+// ══════════════════ 任务执行（HTTP + WebSocket 双通道）══════════════════
+
+function openWebSocket(id) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://${location.host}/api/ws/workflow/${id}`);
+    ws.onopen = () => resolve(ws);
+    ws.onerror = () => reject(new Error("WebSocket 连接失败"));
   });
-  log("start", `HTTP request sent: "${msg}"`);
+}
 
-  // 2. 连 WebSocket 实时看 Node 进度
-  const wsUrl = `ws://${location.host}/api/ws/workflow/${sessionId}`;
-  const ws = new WebSocket(wsUrl);
+async function start() {
+  const btn = document.getElementById("btnSend");
+  const msg = document.getElementById("msg").value;
+  const useRag = document.getElementById("ragToggle").checked;
 
-  ws.onopen = () => {
-    document.getElementById("status").innerText = "🟢 已连接 — 等待 Node 事件...";
-    log("start", "WebSocket connected");
+  document.getElementById("log").innerHTML = "";
+  document.getElementById("sources").innerHTML =
+    `<div class="empty-state">等待对话结束…</div>`;
+  document.getElementById("sourceCount").textContent = "";
+  setLoading(btn, true);
+
+  // 1. 先建立 WebSocket（等到 onopen），避免错过 HTTP 触发后立刻产生的事件
+  let ws;
+  try {
+    ws = await openWebSocket(sessionId);
+  } catch (e) {
+    log("error", `✗ ${e.message}`);
+    setLoading(btn, false);
+    return;
+  }
+  document.getElementById("status").innerText = "🟢 已连接 — 等待 Node 事件...";
+  log("start", "WebSocket connected");
+
+  let finished = false;
+  const finish = () => {
+    if (!finished) { finished = true; setLoading(btn, false); }
   };
 
   ws.onmessage = (e) => {
@@ -66,6 +347,7 @@ function start() {
       case "workflow_end":
         log("end", `★ 工作流结束 — 完成 ${ev.completed_steps}/${ev.total_steps} 步`);
         document.getElementById("status").innerText = "⚫ 工作流已结束";
+        finish();
         ws.close();
         break;
       case "error":
@@ -73,10 +355,41 @@ function start() {
         break;
     }
   };
+  ws.onclose = () => { log("route", "WebSocket 断开"); finish(); };
+  ws.onerror = () => { log("error", "WebSocket 连接失败"); finish(); };
 
-  ws.onclose = () => log("route", "WebSocket 断开");
-  ws.onerror = () => log("error", "WebSocket 连接失败");
+  // 2. 发 HTTP 请求触发工作流 —— 这次要 await 结果，才能拿到 sources
+  log("start", `HTTP request sent: "${msg}"${useRag ? "（RAG 已启用）" : ""}`);
+  try {
+    const res = await apiPost("/api/chat", {
+      message: msg,
+      force_workflow: true,
+      session_id: sessionId,
+      use_rag: useRag,
+    });
+    if (res.rag_enabled) {
+      log("rag", `◆ RAG 命中 ${res.sources.length} 条，已注入上下文`);
+    } else if (useRag) {
+      log("route", "◇ RAG 已启用但无命中（知识库为空或相似度低于阈值）");
+    }
+    renderSources(res.sources || []);
+    if (res.response) log("end", `▸ 最终回复：${res.response.slice(0, 300)}`);
+  } catch (e) {
+    log("error", `✗ 请求失败: ${e.message}`);
+    renderSources([]);
+    finish();
+  }
 }
+
+document.getElementById("btnSend").addEventListener("click", start);
+document.getElementById("msg").addEventListener("keydown", e => {
+  if (e.key === "Enter") start();
+});
+
+// ══════════════════ 启动 ══════════════════
+
+refreshKbStatus();
+setInterval(refreshKbStatus, 30000);
 </script>
 </body>
 </html>

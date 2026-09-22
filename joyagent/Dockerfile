@@ -24,6 +24,7 @@ RUN uv pip install --system \
     "pathspec>=1.1.1" \
     "pytest>=9.1.1" \
     "python-dotenv>=1.2.2" \
+    "python-multipart>=0.0.9" \
     "redis>=8.0.1" \
     "numpy>=1.26,<2.0" \
     "scikit-learn>=1.3,<1.6" \

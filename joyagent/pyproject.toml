@@ -15,8 +15,17 @@ dependencies = [
     "pathspec>=1.1.1",
     "pytest>=9.1.1",
     "python-dotenv>=1.2.2",
+    "python-multipart>=0.0.9",
     "redis>=8.0.1",
     "sentence-transformers>=5.6.0",
     "tiktoken>=0.13.0",
     "uvicorn>=0.49.0",
+]
+
+# RAG 可选依赖 —— 不安装也能正常使用（文本/Markdown/代码入库不受影响），
+# 仅 PDF / DOCX 解析需要。安装：pip install -e ".[rag]"
+[project.optional-dependencies]
+rag = [
+    "pypdf>=4.2.0",
+    "python-docx>=1.1.0",
 ]

@@ -35,7 +35,9 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from app.api.agent import router as agent_router
+from app.api.rag import router as rag_router
 from app.agent.orchestrator import MultiAgentOrchestrator, OrchestratorConfig
+from app.core.config import Config
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -144,6 +146,17 @@ async def lifespan(app: FastAPI):
         if mcp_count > 0:
             print(f"  [OK] Phase 8 MCP: {mcp_count} tools registered "
                   f"(servers: {mcp_registry.connected_server_names})", flush=True)
+
+        # RAG: 预热知识库（建集合 + 打印规模；失败不影响主流程）
+        if Config.RAG_ENABLED:
+            from app.rag.store import get_knowledge_store
+            kb = get_knowledge_store()
+            info = kb.health_check(Config.RAG_COLLECTION)
+            print(f"  [OK] RAG knowledge base '{Config.RAG_COLLECTION}' ready "
+                  f"({info.get('documents', 0)} docs / {info.get('chunks', 0)} chunks)",
+                  flush=True)
+        else:
+            print("  [WARN] RAG disabled (RAG_ENABLED=false)", flush=True)
     except Exception:
         traceback.print_exc(file=sys.stderr)
         sys.stderr.flush()
@@ -187,6 +200,7 @@ app = FastAPI(
 )
 
 app.include_router(agent_router)
+app.include_router(rag_router)
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 

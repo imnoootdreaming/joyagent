@@ -44,6 +44,12 @@ from app.agent.graph.workflow import agent_workflow
 from app.memory.manager import MemoryManager
 # Phase 6: 三级记忆系统统一入口（会话生命周期、上下文检索、自动记存）
 
+from app.core.config import Config
+# 全局配置（RAG 总开关 RAG_ENABLED 与默认值）
+
+from app.rag.retriever import format_context, retrieve, to_sources
+# RAG: 知识库检索 —— retrieve 召回 / format_context 注入 prompt / to_sources 返回引用
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Router
@@ -72,6 +78,20 @@ class ChatRequest(BaseModel):
         description="会话 ID。用于 WebSocket 关联和工作流状态追踪。不传则自动生成。"
     )
 
+    # ── RAG 开关（可选能力，默认关闭 → 完全向后兼容）──
+    use_rag: bool = Field(
+        default=False,
+        description="是否启用 RAG：开启后自动从知识库检索相关片段注入上下文。"
+    )
+    rag_collection: Optional[str] = Field(
+        default=None,
+        description="知识库名。None 时用默认集合。预留多知识库能力。"
+    )
+    rag_top_k: Optional[int] = Field(
+        default=None, ge=1, le=50,
+        description="RAG 召回条数。None 时用 Config.RAG_TOP_K。"
+    )
+
 
 class ChatResponse(BaseModel):
     """POST /api/chat & /api/workflow 共用响应体"""
@@ -89,6 +109,16 @@ class ChatResponse(BaseModel):
         description="LangGraph Planner 生成的计划（仅 workflow 后端有值）"
     )
 
+    # ── RAG 引用来源 ──
+    rag_enabled: bool = Field(
+        default=False,
+        description="本次请求是否实际使用了 RAG（知识库无命中时为 False）"
+    )
+    sources: list = Field(
+        default_factory=list,
+        description="RAG 引用来源列表：{source, score, chunk_index, content, heading_path}"
+    )
+
 
 class WorkflowRequest(BaseModel):
     """POST /api/workflow 请求体（强制 LangGraph）"""
@@ -102,6 +132,11 @@ class WorkflowRequest(BaseModel):
         ge=1, le=10,
         description="最大反思轮次（1-10，默认 3）"
     )
+
+    # ── RAG 开关（与 /api/chat 一致）──
+    use_rag: bool = Field(default=False, description="是否启用 RAG 知识库检索")
+    rag_collection: Optional[str] = Field(default=None, description="知识库名")
+    rag_top_k: Optional[int] = Field(default=None, ge=1, le=50, description="RAG 召回条数")
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -187,6 +222,50 @@ def _build_initial_state(message: str, max_reflections: int = 3) -> dict:
         "error_message": None,               # 暂无错误
         "tool_call_history": [],             # 暂无工具调用记录
     }
+
+
+async def _retrieve_rag_context(
+    message: str,
+    collection: Optional[str] = None,
+    top_k: Optional[int] = None,
+) -> tuple[list, list, bool]:
+    """
+    检索 RAG 知识库，产出「注入 prompt 的上下文」+「返回前端的引用来源」。
+
+    设计原则：RAG 是增强，不是依赖。
+      任何异常（知识库为空 / ChromaDB 不可用 / embedding 失败）都被
+      app.rag.retriever 吞掉并返回空结果，对话照常进行。
+
+    Args:
+        message:    用户消息（直接作为检索Query）
+        collection: 知识库名，None → Config.RAG_COLLECTION
+        top_k:      召回条数，None → Config.RAG_TOP_K
+
+    Returns:
+        (context_messages, sources, enabled)
+          context_messages: 可直接拼进 messages 的 [{"role":"user","content":...}]
+          sources:          前端可渲染的引用来源列表
+          enabled:          是否真的用上了 RAG（无命中时为 False）
+    """
+    if not Config.RAG_ENABLED:
+        return [], [], False
+
+    try:
+        hits = await retrieve(message, collection=collection, top_k=top_k)
+    except Exception as e:                            # 双保险：绝不因 RAG 中断对话
+        print(f"  [rag] retrieval error (ignored): {e}")
+        return [], [], False
+
+    if not hits:
+        return [], [], False
+
+    context_text = format_context(hits)
+    if not context_text:
+        return [], [], False
+
+    print(f"  [rag] {len(hits)} hit(s) injected from "
+          f"'{collection or Config.RAG_COLLECTION}'")
+    return [{"role": "user", "content": context_text}], to_sources(hits), True
 
 
 def _extract_final_response(final_state: dict) -> str:
@@ -383,11 +462,24 @@ async def chat(request: ChatRequest):
 
       # 强制走 LangGraph
       curl -X POST /api/chat -d '{"message": "读取 main.py", "force_workflow": true}'
+
+      # 启用 RAG（自动从知识库检索相关片段注入上下文，响应体返回 sources）
+      curl -X POST /api/chat -d '{"message": "项目有哪些模块", "use_rag": true}'
     """
     session_id = request.session_id or _new_session_id()
 
     # ── Phase 6: 创建会话级 MemoryManager ──
     mm = MemoryManager(session_id=session_id)
+
+    # ── RAG: 开关打开时检索知识库 ──
+    rag_context, sources, rag_enabled = (
+        await _retrieve_rag_context(
+            request.message,
+            collection=request.rag_collection,
+            top_k=request.rag_top_k,
+        )
+        if request.use_rag else ([], [], False)
+    )
 
     if _should_use_workflow(request.message, request.force_workflow):
         # ── Phase 3: LangGraph Workflow (astream + WebSocket) ──────
@@ -395,9 +487,10 @@ async def chat(request: ChatRequest):
         history_context = await mm.begin_session(request.message)
 
         initial_state = _build_initial_state(request.message)
-        # 注入历史上下文到 messages
-        if history_context:
-            initial_state["messages"] = history_context + initial_state["messages"]
+        # 注入上下文到 messages：RAG 知识库 → 历史记忆 → 用户消息
+        injected = rag_context + (history_context or [])
+        if injected:
+            initial_state["messages"] = injected + initial_state["messages"]
 
         final_state = await _run_workflow_streaming(
             initial_state, session_id,
@@ -422,6 +515,8 @@ async def chat(request: ChatRequest):
                 "tool_name": s.get("tool_name"),
                 "status": s.get("status"),
             } for s in plan],
+            rag_enabled=rag_enabled,
+            sources=sources,
         )
     else:
         # ── Phase 1-2: Simple Agent ──────────────────────────────
@@ -429,7 +524,7 @@ async def chat(request: ChatRequest):
         context = await mm.begin_session(request.message)
         result = await simple_agent.agent_loop(
             request.message,
-            context=context,
+            context=(rag_context + (context or [])) or None,
             memory_manager=mm,
         )
 
@@ -441,6 +536,8 @@ async def chat(request: ChatRequest):
             session_id=session_id,
             backend="simple",
             plan=[],
+            rag_enabled=rag_enabled,
+            sources=sources,
         )
 
 
@@ -465,13 +562,24 @@ async def workflow(request: WorkflowRequest):
     mm = MemoryManager(session_id=session_id)
     history_context = await mm.begin_session(request.message)
 
+    # ── RAG: 开关打开时检索知识库 ──
+    rag_context, sources, rag_enabled = (
+        await _retrieve_rag_context(
+            request.message,
+            collection=request.rag_collection,
+            top_k=request.rag_top_k,
+        )
+        if request.use_rag else ([], [], False)
+    )
+
     initial_state = _build_initial_state(
         request.message,
         max_reflections=request.max_reflections,
     )
-    # 注入历史上下文
-    if history_context:
-        initial_state["messages"] = history_context + initial_state["messages"]
+    # 注入上下文：RAG 知识库 → 历史记忆 → 用户消息
+    injected = rag_context + (history_context or [])
+    if injected:
+        initial_state["messages"] = injected + initial_state["messages"]
 
     final_state = await _run_workflow_streaming(
         initial_state, session_id,
@@ -496,6 +604,8 @@ async def workflow(request: WorkflowRequest):
             "tool_name": s.get("tool_name"),
             "status": s.get("status"),
         } for s in plan],
+        rag_enabled=rag_enabled,
+        sources=sources,
     )
 
 
